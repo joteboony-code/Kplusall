@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dashboardHtml, loginHtml } from "../src/index";
+import { dashboardHtml, encryptionKeyBytes, loginHtml } from "../src/index";
 
 describe("control dashboard", () => {
   it("ships syntactically valid client JavaScript", () => {
@@ -32,5 +32,21 @@ describe("control dashboard", () => {
 
     expect(html).toContain("เข้าสู่ศูนย์จัดการระบบทั้ง 5 ภูมิภาค");
     expect(html).toContain("linear-gradient");
+  });
+
+  it("validates the encryption key before saving control secrets", () => {
+    const valid = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
+
+    expect(encryptionKeyBytes(valid)).toHaveLength(32);
+    expect(() => encryptionKeyBytes("not valid base64!")).toThrow("valid base64");
+    expect(() => encryptionKeyBytes(btoa("too short"))).toThrow("32 bytes");
+  });
+
+  it("shows a short API error instead of dumping a Cloudflare HTML page", () => {
+    const html = dashboardHtml();
+
+    expect(html).toContain("บันทึกไม่สำเร็จ (HTTP ");
+    expect(html).toContain("response.json()");
+    expect(html).not.toContain("notify(await response.text(),true)");
   });
 });

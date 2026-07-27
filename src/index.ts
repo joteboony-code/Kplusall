@@ -21,11 +21,21 @@ async function hmac(text: string, key: string) {
   return b64(new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(text))));
 }
 async function safeEqual(a: string, b: string) { return a.length === b.length && (await hmac(a, "compare")) === (await hmac(b, "compare")); }
-async function cryptoKey(env: Env) {
-  if (!env.CONFIG_ENCRYPTION_KEY) throw new Error("CONFIG_ENCRYPTION_KEY is not configured");
-  const raw = unb64(env.CONFIG_ENCRYPTION_KEY);
+export function encryptionKeyBytes(value?: string) {
+  if (!value) throw new Error("CONFIG_ENCRYPTION_KEY is not configured");
+  let raw: Uint8Array;
+  try {
+    raw = unb64(value.trim());
+  } catch {
+    throw new Error("CONFIG_ENCRYPTION_KEY must be valid base64 encoded 32 bytes");
+  }
   if (raw.byteLength !== 32) throw new Error("CONFIG_ENCRYPTION_KEY must be base64 encoded 32 bytes");
-  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+  return raw;
+}
+async function cryptoKey(env: Env) {
+  const raw = encryptionKeyBytes(env.CONFIG_ENCRYPTION_KEY);
+  const keyData = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+  return crypto.subtle.importKey("raw", keyData, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 async function seal(value: string, env: Env): Promise<ArrayBuffer | null> {
   if (!value) return null;
@@ -219,7 +229,7 @@ export function dashboardHtml() { return `<!doctype html>
       button.disabled=true;button.textContent='กำลังบันทึก...';
       const body={region,enabled:document.querySelector('#e-'+region).checked,lineSecret:document.querySelector('#s-'+region).value,lineToken:document.querySelector('#t-'+region).value,ocrKey:document.querySelector('#o-'+region).value};
       const response=await fetch('/admin/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-      if(response.ok){notify('บันทึก '+meta[region].name+' เรียบร้อยแล้ว');await load()}else{notify(await response.text(),true);button.disabled=false;button.textContent='บันทึก '+meta[region].name}
+      if(response.ok){notify('บันทึก '+meta[region].name+' เรียบร้อยแล้ว');await load()}else{let message='บันทึกไม่สำเร็จ (HTTP '+response.status+')';try{const result=await response.json();if(result&&result.error)message=result.error}catch{}notify(message,true);button.disabled=false;button.textContent='บันทึก '+meta[region].name}
     }
     load().catch(()=>{app.innerHTML='<div class="loading">โหลดข้อมูลไม่สำเร็จ กรุณารีเฟรชหน้าอีกครั้ง</div>';notify('โหลดข้อมูลไม่สำเร็จ',true)});
   </script>
@@ -247,7 +257,22 @@ async function admin(request: Request, env: Env, url: URL) {
   const token = cookie(request, "kplusall_admin"); const [body, sig] = token?.split(".") ?? []; const payload = body ? dec.decode(unb64(body)) : "";
   if (!sig || !(await safeEqual(sig, await hmac(payload, env.CONFIG_ENCRYPTION_KEY))) || Number(payload) < Date.now()) return new Response(loginHtml(), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
   if (url.pathname === "/admin/api/config" && request.method === "GET") { const rows = await env.DB.prepare("SELECT region,enabled,line_channel_secret,line_channel_token,ocrspace_api_key FROM region_config ORDER BY region").all<RegionConfigRow>(); return json(rows.results.map((r) => ({ region:r.region, enabled:Boolean(r.enabled), hasLineSecret:Boolean(r.line_channel_secret), hasLineToken:Boolean(r.line_channel_token), hasOcrKey:Boolean(r.ocrspace_api_key) }))); }
-  if (url.pathname === "/admin/api/config" && request.method === "POST") { const input = await request.json<any>(); if (!isRegion(input.region)) return json({ error:"invalid region" }, 400); const old = await config(env,input.region); const secret = input.lineSecret ? await seal(String(input.lineSecret),env) : await seal(old.lineSecret,env); const tokenValue = input.lineToken ? await seal(String(input.lineToken),env) : await seal(old.lineToken,env); const key = input.ocrKey ? await seal(String(input.ocrKey),env) : await seal(old.ocrKey,env); await env.DB.prepare("UPDATE region_config SET enabled=?,line_channel_secret=?,line_channel_token=?,ocrspace_api_key=?,updated_at=CURRENT_TIMESTAMP WHERE region=?").bind(input.enabled?1:0,secret,tokenValue,key,input.region).run(); await audit(env,"config_updated","admin config updated",input.region); return json({ ok:true }); }
+  if (url.pathname === "/admin/api/config" && request.method === "POST") {
+    try {
+      const input = await request.json<any>();
+      if (!isRegion(input.region)) return json({ error:"invalid region" }, 400);
+      const old = await config(env,input.region);
+      const secret = input.lineSecret ? await seal(String(input.lineSecret),env) : await seal(old.lineSecret,env);
+      const tokenValue = input.lineToken ? await seal(String(input.lineToken),env) : await seal(old.lineToken,env);
+      const key = input.ocrKey ? await seal(String(input.ocrKey),env) : await seal(old.ocrKey,env);
+      await env.DB.prepare("UPDATE region_config SET enabled=?,line_channel_secret=?,line_channel_token=?,ocrspace_api_key=?,updated_at=CURRENT_TIMESTAMP WHERE region=?").bind(input.enabled?1:0,secret,tokenValue,key,input.region).run();
+      await audit(env,"config_updated","admin config updated",input.region);
+      return json({ ok:true });
+    } catch (error) {
+      console.error("admin config update failed", error);
+      return json({ error:"บันทึกการตั้งค่าไม่สำเร็จ กรุณาตรวจสอบ Worker Secret แล้วลองใหม่" }, 500);
+    }
+  }
   return new Response(dashboardHtml(), { headers:{ "content-type":"text/html; charset=utf-8", "cache-control":"no-store" } });
 }
 
