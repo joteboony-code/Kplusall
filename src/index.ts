@@ -137,14 +137,8 @@ export function imageSetMetadata(event: LineEvent) {
   };
 }
 
-async function webhook(request: Request, env: Env, region: Region) {
-  let c: RegionConfig;
-  try { c = await config(env, region); } catch { return json({ error: "control secrets not initialized" }, 503); }
-  if (!c.enabled || !c.lineSecret || !c.lineToken || !c.ocrKey) return json({ error: "region is not configured" }, 503);
-  const raw = await request.text();
-  if (!(await validSignature(raw, request.headers.get("x-line-signature"), c.lineSecret))) { await audit(env, "signature_invalid", "LINE signature rejected", region); return new Response("Unauthorized", { status: 401 }); }
-  const payload = JSON.parse(raw) as { events?: LineEvent[] };
-  for (const event of payload.events ?? []) {
+async function processWebhookEvents(events: LineEvent[], env: Env, region: Region) {
+  for (const event of events) {
     if (event.type !== "message" || !event.source?.userId) continue;
     const userId = event.source.userId;
     if (event.message?.type === "text") {
@@ -195,6 +189,29 @@ async function webhook(request: Request, env: Env, region: Region) {
     await env.OCR_JOBS.send({ id, region });
     await audit(env, "image_queued", `${parent.job_number}${imageSet.total ? ` รูป ${imageSet.index ?? "?"}/${imageSet.total}` : ""}`, region);
   }
+}
+
+async function recordWebhookFailure(env: Env, region: Region, error: unknown) {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.error("background webhook processing failed", { region, error });
+  try {
+    await audit(env, "webhook_background_error", detail, region);
+  } catch (auditError) {
+    console.error("failed to audit background webhook error", auditError);
+  }
+}
+
+async function webhook(request: Request, env: Env, region: Region, ctx: ExecutionContext) {
+  let c: RegionConfig;
+  try { c = await config(env, region); } catch { return json({ error: "control secrets not initialized" }, 503); }
+  if (!c.enabled || !c.lineSecret || !c.lineToken || !c.ocrKey) return json({ error: "region is not configured" }, 503);
+  const raw = await request.text();
+  if (!(await validSignature(raw, request.headers.get("x-line-signature"), c.lineSecret))) {
+    await audit(env, "signature_invalid", "LINE signature rejected", region);
+    return new Response("Unauthorized", { status: 401 });
+  }
+  const payload = JSON.parse(raw) as { events?: LineEvent[] };
+  ctx.waitUntil(processWebhookEvents(payload.events ?? [], env, region).catch((error) => recordWebhookFailure(env, region, error)));
   return new Response("OK");
 }
 
@@ -510,12 +527,38 @@ export function loginHtml() { return `<!doctype html>
 </head>
 <body><form class="card" method="post" action="/admin/login"><div class="icon">✦</div><h1>Kplusall <span class="gradient">Control</span></h1><p>เข้าสู่ศูนย์จัดการระบบทั้ง 5 ภูมิภาค</p><input name="password" type="password" placeholder="Admin password" autocomplete="current-password" required autofocus><button>เข้าสู่ระบบ</button><small>🔒 การเชื่อมต่อและข้อมูล Secret ได้รับการปกป้อง</small></form></body>
 </html>`; }
+
+async function requeueStuckJobs(env: Env) {
+  const rows = await env.DB.prepare(`SELECT id,region
+    FROM slip_jobs
+    WHERE status='queued' AND updated_at < datetime('now','-1 minute')
+    ORDER BY created_at
+    LIMIT 100`).all<{ id: string; region: Region }>();
+  let requeued = 0;
+  for (const row of rows.results) {
+    await env.OCR_JOBS.send({ id: row.id, region: row.region });
+    await env.DB.prepare("UPDATE slip_jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='queued'")
+      .bind(row.id).run();
+    await audit(env, "image_requeued", row.id, row.region);
+    requeued++;
+  }
+  return requeued;
+}
+
 async function admin(request: Request, env: Env, url: URL) {
   if (!env.ADMIN_PASSWORD || !env.CONFIG_ENCRYPTION_KEY) return new Response("Admin setup required: set ADMIN_PASSWORD and CONFIG_ENCRYPTION_KEY as Worker Secrets.", { status: 503 });
   if (url.pathname === "/admin/login" && request.method === "POST") { const form = await request.formData(); if (!(await safeEqual(String(form.get("password") ?? ""), env.ADMIN_PASSWORD))) return new Response("Unauthorized", { status: 401 }); const payload = `${Date.now() + 8 * 3600_000}`; const token = `${b64(enc.encode(payload))}.${await hmac(payload, env.CONFIG_ENCRYPTION_KEY)}`; return new Response(null, { status: 303, headers: { location: "/admin", "set-cookie": `kplusall_admin=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=28800` } }); }
   const token = cookie(request, "kplusall_admin"); const [body, sig] = token?.split(".") ?? []; const payload = body ? dec.decode(unb64(body)) : "";
   if (!sig || !(await safeEqual(sig, await hmac(payload, env.CONFIG_ENCRYPTION_KEY))) || Number(payload) < Date.now()) return new Response(loginHtml(), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
   if (url.pathname === "/admin/api/config" && request.method === "GET") { const rows = await env.DB.prepare("SELECT region,enabled,line_channel_secret,line_channel_token,ocrspace_api_key FROM region_config ORDER BY region").all<RegionConfigRow>(); return json(rows.results.map((r) => ({ region:r.region, enabled:Boolean(r.enabled), hasLineSecret:Boolean(r.line_channel_secret), hasLineToken:Boolean(r.line_channel_token), hasOcrKey:Boolean(r.ocrspace_api_key) }))); }
+  if (url.pathname === "/admin/api/requeue-stuck" && request.method === "POST") {
+    try {
+      return json({ ok: true, requeued: await requeueStuckJobs(env) });
+    } catch (error) {
+      console.error("requeue stuck jobs failed", error);
+      return json({ error: "requeue failed" }, 500);
+    }
+  }
   if (url.pathname === "/admin/api/logs" && request.method === "GET") {
     const region = url.searchParams.get("region") ?? "north";
     if (!isRegion(region)) return json({ error:"invalid region" }, 400);
@@ -563,7 +606,7 @@ async function admin(request: Request, env: Env, url: URL) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/webhook/")) { const region = url.pathname.split("/")[2]; if (!isRegion(region) || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region); }
+    if (url.pathname.startsWith("/webhook/")) { const region = url.pathname.split("/")[2]; if (!isRegion(region) || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region, ctx); }
     if (url.pathname.startsWith("/admin")) return admin(request, env, url);
     if (url.pathname === "/health") return json({ ok:true, service:"kplusall" });
     return new Response("Kplusall Worker", { status:200 });
