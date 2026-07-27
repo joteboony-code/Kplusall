@@ -123,8 +123,124 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
   await audit(env, `ocr_${result}`, row.job_number, data.region);
 }
 
-export function dashboardHtml() { return `<!doctype html><html lang="th"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kplusall Control</title><style>body{font:16px system-ui;margin:2rem;background:#f5f7fb;color:#172033}main{max-width:980px;margin:auto}fieldset{background:white;border:1px solid #d9dfeb;border-radius:10px;margin:1rem 0;padding:1rem}input{width:100%;box-sizing:border-box;margin:.35rem 0;padding:.65rem}button{padding:.65rem 1rem;background:#1466d9;color:white;border:0;border-radius:6px;cursor:pointer}.muted{color:#657084;font-size:.9rem}</style><main><h1>Kplusall Control</h1><p class="muted">ค่า Secret ที่บันทึกแล้วจะไม่ถูกแสดงกลับมา ใส่เฉพาะค่าที่ต้องการเปลี่ยน</p><div id="app">Loading…</div></main><script>const regions=['north','central','isan','south','bangkok'];async function load(){let r=await fetch('/admin/api/config');if(!r.ok){location='/admin';return}let d=await r.json();document.querySelector('#app').innerHTML=regions.map(x=>{let a=d.find(v=>v.region===x)||{enabled:false};return '<fieldset><h2>'+x+'</h2><label><input type="checkbox" id="e-'+x+'" '+(a.enabled?'checked':'')+'> เปิดใช้งาน</label><input id="s-'+x+'" placeholder="LINE Channel Secret (ใส่เมื่อเปลี่ยน)"><input id="t-'+x+'" placeholder="LINE Channel Access Token (ใส่เมื่อเปลี่ยน)"><input id="o-'+x+'" placeholder="OCR.space API Key (ใส่เมื่อเปลี่ยน)"><button class="save-region" data-region="'+x+'">บันทึก '+x+'</button><p class="muted">Secret: '+(a.hasLineSecret?'ตั้งแล้ว':'ยังไม่ตั้ง')+' · Token: '+(a.hasLineToken?'ตั้งแล้ว':'ยังไม่ตั้ง')+' · OCR: '+(a.hasOcrKey?'ตั้งแล้ว':'ยังไม่ตั้ง')+'</p></fieldset>'}).join('');document.querySelectorAll('.save-region').forEach(button=>button.addEventListener('click',()=>save(button.dataset.region)))}async function save(region){let b={region,enabled:document.querySelector('#e-'+region).checked,lineSecret:document.querySelector('#s-'+region).value,lineToken:document.querySelector('#t-'+region).value,ocrKey:document.querySelector('#o-'+region).value};let r=await fetch('/admin/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});alert(r.ok?'บันทึกแล้ว':await r.text());if(r.ok)load()}load()</script></html>`; }
-function loginHtml() { return `<!doctype html><meta charset="utf-8"><title>Kplusall Login</title><form method="post" action="/admin/login" style="max-width:360px;margin:8rem auto;font:16px system-ui"><h1>Kplusall Control</h1><input name="password" type="password" placeholder="Admin password" required style="width:100%;padding:12px;box-sizing:border-box"><button style="margin-top:12px;padding:12px">Login</button></form>`; }
+export function dashboardHtml() { return `<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#8b5cf6">
+  <title>Kplusall Control</title>
+  <style>
+    :root{--ink:#2d2741;--muted:#777089;--purple:#8b5cf6;--pink:#e78bc5;--line:#ece7f5;--ok:#279b70;--warn:#d99032}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);background:linear-gradient(145deg,#fff5f8 0%,#f7f2ff 48%,#eee9ff 100%);background-attachment:fixed}
+    body:before,body:after{content:"";position:fixed;border-radius:999px;filter:blur(10px);pointer-events:none;z-index:-1}
+    body:before{width:360px;height:360px;background:rgba(243,178,211,.28);top:-120px;left:-110px}
+    body:after{width:430px;height:430px;background:rgba(164,137,246,.22);right:-150px;bottom:-170px}
+    .shell{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:34px 0 70px}
+    .hero{position:relative;overflow:hidden;padding:32px;border:1px solid rgba(255,255,255,.85);border-radius:30px;background:rgba(255,255,255,.73);box-shadow:0 24px 65px rgba(91,70,137,.13);backdrop-filter:blur(18px)}
+    .hero:after{content:"✦";position:absolute;right:34px;top:20px;font-size:120px;line-height:1;color:rgba(139,92,246,.08)}
+    .brand{display:flex;align-items:center;gap:16px;position:relative;z-index:1}
+    .brand-icon{display:grid;place-items:center;width:58px;height:58px;border-radius:19px;color:white;font-size:28px;background:linear-gradient(135deg,var(--pink),var(--purple));box-shadow:0 13px 28px rgba(139,92,246,.3)}
+    h1{font-size:clamp(28px,4vw,42px);line-height:1.1;margin:0;letter-spacing:-.8px}
+    .gradient-text{background:linear-gradient(90deg,var(--purple),var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
+    .subtitle{margin:9px 0 0;color:var(--muted)}
+    .summary{position:relative;z-index:1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:26px}
+    .summary-item{padding:15px 17px;border:1px solid rgba(223,215,239,.85);border-radius:18px;background:rgba(255,255,255,.68)}
+    .summary-value{display:block;font-size:24px;font-weight:800}
+    .summary-label{color:var(--muted);font-size:13px}
+    .section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:34px 4px 15px}
+    .section-head h2{margin:0;font-size:21px}
+    .section-head p{margin:3px 0 0;color:var(--muted);font-size:13px}
+    .secure-note{display:flex;align-items:center;gap:7px;padding:8px 12px;border-radius:999px;color:#6e518e;background:rgba(255,255,255,.7);font-size:12px;font-weight:700}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+    .region-card{position:relative;padding:22px;border:1px solid rgba(255,255,255,.92);border-radius:25px;background:rgba(255,255,255,.82);box-shadow:0 16px 40px rgba(73,55,108,.09);backdrop-filter:blur(14px);transition:.2s ease}
+    .region-card:hover{transform:translateY(-2px);box-shadow:0 20px 46px rgba(73,55,108,.13)}
+    .region-card:last-child:nth-child(odd){grid-column:1/-1}
+    .card-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:20px}
+    .region-title{display:flex;align-items:center;gap:12px}
+    .region-icon{display:grid;place-items:center;width:44px;height:44px;border-radius:15px;background:linear-gradient(135deg,#f9dce9,#e5dbff);font-size:21px}
+    .region-name{font-size:19px;font-weight:800}
+    .region-code{color:var(--muted);font-size:11px;letter-spacing:.8px;text-transform:uppercase}
+    .badge{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border-radius:999px;font-size:11px;font-weight:800}
+    .badge:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 4px currentColor;opacity:.72}
+    .badge.ready{color:var(--ok);background:#eaf8f2}
+    .badge.incomplete{color:var(--warn);background:#fff5e7}
+    .toggle-row{display:flex;align-items:center;justify-content:space-between;padding:11px 13px;margin-bottom:15px;border-radius:15px;background:#faf8fd}
+    .toggle-label strong{display:block;font-size:13px}.toggle-label span{color:var(--muted);font-size:11px}
+    .switch{position:relative;width:48px;height:28px;flex:none}.switch input{position:absolute;opacity:0;pointer-events:none}.slider{position:absolute;inset:0;border-radius:999px;background:#d8d1e3;cursor:pointer;transition:.2s}.slider:after{content:"";position:absolute;width:22px;height:22px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 2px 8px rgba(45,39,65,.2);transition:.2s}.switch input:checked+.slider{background:linear-gradient(90deg,var(--pink),var(--purple))}.switch input:checked+.slider:after{transform:translateX(20px)}
+    .field{display:block;margin-top:11px}.field-label{display:flex;justify-content:space-between;margin:0 2px 6px;font-size:12px;font-weight:700}.field-state{color:var(--muted);font-weight:500}
+    input[type=text],input[type=password]{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:13px;outline:0;background:#fff;color:var(--ink);transition:.18s;box-shadow:0 2px 4px rgba(45,39,65,.025)}
+    input[type=text]:focus,input[type=password]:focus{border-color:#b28af2;box-shadow:0 0 0 4px rgba(139,92,246,.1)}
+    .save-region{width:100%;margin-top:17px;padding:12px 16px;border:0;border-radius:14px;color:white;font-weight:800;cursor:pointer;background:linear-gradient(100deg,#342d48 0%,#5a487c 45%,#8b5cf6 100%);box-shadow:0 10px 23px rgba(76,58,114,.2);transition:.18s}
+    .save-region:hover{transform:translateY(-1px);box-shadow:0 13px 28px rgba(76,58,114,.28)}.save-region:disabled{opacity:.65;cursor:wait}
+    .loading{grid-column:1/-1;text-align:center;padding:48px;border-radius:25px;background:rgba(255,255,255,.7);color:var(--muted)}
+    .spinner{display:inline-block;width:25px;height:25px;margin-bottom:8px;border:3px solid #e8def7;border-top-color:var(--purple);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+    .toast{position:fixed;right:22px;bottom:22px;z-index:20;padding:13px 17px;border-radius:14px;color:white;background:#342d48;box-shadow:0 14px 34px rgba(45,39,65,.25);opacity:0;transform:translateY(15px);pointer-events:none;transition:.25s}.toast.show{opacity:1;transform:none}.toast.error{background:#b94561}
+    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="brand"><div class="brand-icon">✦</div><div><h1>Kplusall <span class="gradient-text">Control</span></h1><p class="subtitle">ศูนย์จัดการ LINE OA และ OCR.space สำหรับทั้ง 5 ภูมิภาค</p></div></div>
+      <div class="summary">
+        <div class="summary-item"><span class="summary-value">5</span><span class="summary-label">ภูมิภาคทั้งหมด</span></div>
+        <div class="summary-item"><span class="summary-value" id="active-count">—</span><span class="summary-label">กำลังเปิดใช้งาน</span></div>
+        <div class="summary-item"><span class="summary-value" id="ready-count">—</span><span class="summary-label">ตั้งค่าครบพร้อมใช้</span></div>
+      </div>
+    </section>
+    <div class="section-head"><div><h2>ตั้งค่าระบบแต่ละภูมิภาค</h2><p>กรอกเฉพาะค่าที่ต้องการเปลี่ยน ค่าเดิมจะไม่ถูกแสดงกลับมา</p></div><div class="secure-note">🔒 Secret เข้ารหัสแล้ว</div></div>
+    <section class="grid" id="app"><div class="loading"><span class="spinner"></span><br>กำลังโหลดข้อมูล...</div></section>
+  </main>
+  <div class="toast" id="toast"></div>
+  <script>
+    const regions=['north','central','isan','south','bangkok'];
+    const meta={north:{name:'ภาคเหนือ',icon:'⛰️'},central:{name:'ภาคกลาง',icon:'🌾'},isan:{name:'ภาคอีสาน',icon:'☀️'},south:{name:'ภาคใต้',icon:'🌊'},bangkok:{name:'กรุงเทพฯ',icon:'🏙️'}};
+    const app=document.querySelector('#app');
+    function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
+    function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
+    async function load(){
+      const response=await fetch('/admin/api/config');
+      if(!response.ok){location='/admin';return}
+      const data=await response.json();
+      const active=data.filter(item=>item.enabled).length;
+      const ready=data.filter(item=>item.hasLineSecret&&item.hasLineToken&&item.hasOcrKey).length;
+      document.querySelector('#active-count').textContent=String(active);
+      document.querySelector('#ready-count').textContent=String(ready);
+      app.innerHTML=regions.map(region=>{
+        const item=data.find(value=>value.region===region)||{enabled:false};
+        const complete=Boolean(item.hasLineSecret&&item.hasLineToken&&item.hasOcrKey);
+        return '<article class="region-card"><div class="card-head"><div class="region-title"><div class="region-icon">'+meta[region].icon+'</div><div><div class="region-name">'+meta[region].name+'</div><div class="region-code">'+region+'</div></div></div><span class="badge '+(complete?'ready':'incomplete')+'">'+(complete?'พร้อมใช้งาน':'ตั้งค่าไม่ครบ')+'</span></div><div class="toggle-row"><div class="toggle-label"><strong>เปิดใช้งานภูมิภาคนี้</strong><span>รับ Webhook และประมวลผล OCR</span></div><label class="switch"><input type="checkbox" id="e-'+region+'" '+(item.enabled?'checked':'')+'><span class="slider"></span></label></div>'+field(region,'s','LINE Channel Secret','ใส่เมื่อสร้างหรือเปลี่ยน Secret',item.hasLineSecret)+field(region,'t','LINE Channel Access Token','ใส่เมื่อสร้างหรือเปลี่ยน Token',item.hasLineToken)+field(region,'o','OCR.space API Key','ใส่ API Key ของภูมิภาคนี้',item.hasOcrKey)+'<button class="save-region" data-region="'+region+'">บันทึก '+meta[region].name+'</button></article>'
+      }).join('');
+      document.querySelectorAll('.save-region').forEach(button=>button.addEventListener('click',()=>save(button.dataset.region,button)));
+    }
+    async function save(region,button){
+      button.disabled=true;button.textContent='กำลังบันทึก...';
+      const body={region,enabled:document.querySelector('#e-'+region).checked,lineSecret:document.querySelector('#s-'+region).value,lineToken:document.querySelector('#t-'+region).value,ocrKey:document.querySelector('#o-'+region).value};
+      const response=await fetch('/admin/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+      if(response.ok){notify('บันทึก '+meta[region].name+' เรียบร้อยแล้ว');await load()}else{notify(await response.text(),true);button.disabled=false;button.textContent='บันทึก '+meta[region].name}
+    }
+    load().catch(()=>{app.innerHTML='<div class="loading">โหลดข้อมูลไม่สำเร็จ กรุณารีเฟรชหน้าอีกครั้ง</div>';notify('โหลดข้อมูลไม่สำเร็จ',true)});
+  </script>
+</body>
+</html>`; }
+export function loginHtml() { return `<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#8b5cf6"><title>Kplusall Login</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;font:15px system-ui,-apple-system,"Segoe UI",sans-serif;color:#2d2741;background:radial-gradient(circle at 10% 15%,#ffe6ee 0,transparent 34%),radial-gradient(circle at 85% 85%,#dcd2ff 0,transparent 35%),linear-gradient(145deg,#fff8fa,#f3efff)}
+    .card{width:min(430px,100%);padding:44px 36px;border:1px solid rgba(255,255,255,.9);border-radius:32px;background:rgba(255,255,255,.78);box-shadow:0 28px 70px rgba(80,59,124,.18);backdrop-filter:blur(20px);text-align:center}
+    .icon{display:grid;place-items:center;width:62px;height:62px;margin:0 auto 22px;border-radius:20px;color:white;font-size:30px;background:linear-gradient(135deg,#e78bc5,#8b5cf6);box-shadow:0 14px 30px rgba(139,92,246,.3)}
+    h1{margin:0;font-size:32px;letter-spacing:-.5px}.gradient{background:linear-gradient(90deg,#8b5cf6,#e78bc5);-webkit-background-clip:text;background-clip:text;color:transparent}p{margin:10px 0 26px;color:#777089}
+    input{width:100%;padding:14px 15px;border:1px solid #e9e2f3;border-radius:14px;outline:0;background:white;font:inherit}input:focus{border-color:#ad83ef;box-shadow:0 0 0 4px rgba(139,92,246,.1)}
+    button{width:100%;margin-top:14px;padding:14px;border:0;border-radius:14px;color:white;font:800 15px system-ui;cursor:pointer;background:linear-gradient(100deg,#342d48,#8b5cf6);box-shadow:0 12px 26px rgba(76,58,114,.25)}
+    small{display:block;margin-top:22px;color:#938ba0}
+  </style>
+</head>
+<body><form class="card" method="post" action="/admin/login"><div class="icon">✦</div><h1>Kplusall <span class="gradient">Control</span></h1><p>เข้าสู่ศูนย์จัดการระบบทั้ง 5 ภูมิภาค</p><input name="password" type="password" placeholder="Admin password" autocomplete="current-password" required autofocus><button>เข้าสู่ระบบ</button><small>🔒 การเชื่อมต่อและข้อมูล Secret ได้รับการปกป้อง</small></form></body>
+</html>`; }
 async function admin(request: Request, env: Env, url: URL) {
   if (!env.ADMIN_PASSWORD || !env.CONFIG_ENCRYPTION_KEY) return new Response("Admin setup required: set ADMIN_PASSWORD and CONFIG_ENCRYPTION_KEY as Worker Secrets.", { status: 503 });
   if (url.pathname === "/admin/login" && request.method === "POST") { const form = await request.formData(); if (!(await safeEqual(String(form.get("password") ?? ""), env.ADMIN_PASSWORD))) return new Response("Unauthorized", { status: 401 }); const payload = `${Date.now() + 8 * 3600_000}`; const token = `${b64(enc.encode(payload))}.${await hmac(payload, env.CONFIG_ENCRYPTION_KEY)}`; return new Response(null, { status: 303, headers: { location: "/admin", "set-cookie": `kplusall_admin=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=28800` } }); }
