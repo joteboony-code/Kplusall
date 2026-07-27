@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeOcr, classify, imageSetMetadata } from "../src/index";
+import { analyzeOcr, classify, imageSetMetadata, lineScopeFromEvent } from "../src/index";
 
 describe("original KPLUS settlement rules", () => {
   it("passes when both markers and 1.22 are present", () => {
@@ -16,8 +16,12 @@ describe("original KPLUS settlement rules", () => {
     expect(classify("KPLUS 1.22")).toBe("silent");
     expect(classify("SETTLEMENT 1.22")).toBe("silent");
   });
-  it("holds for a later fallback when the amount is wrong", () => {
-    expect(classify("KPLUS SETTLEMENT 9.99")).toBe("needs_fallback");
+  it("fails when KPLUS and SETTLEMENT have a readable wrong amount", () => {
+    expect(classify("KPLUS SETTLEMENT 9.99")).toBe("failed");
+  });
+
+  it("holds for a later fallback when the amount is unreadable", () => {
+    expect(classify("KPLUS SETTLEMENT amount unreadable")).toBe("needs_fallback");
   });
 
   it("returns the details needed by the regional control log", () => {
@@ -30,7 +34,7 @@ describe("original KPLUS settlement rules", () => {
     });
 
     expect(analyzeOcr("KPLUS SETTLEMENT amount 9.99")).toMatchObject({
-      result: "needs_fallback",
+      result: "failed",
       foundKplus: true,
       foundSettlement: true,
       matchedAmount: null,
@@ -59,5 +63,20 @@ describe("original KPLUS settlement rules", () => {
     expect(imageSetMetadata({
       message: { type: "image", id: "single-image" }
     })).toEqual({ id: null, index: null, total: null });
+  });
+
+  it("scopes a technician by room, sender, and Tid context", () => {
+    expect(lineScopeFromEvent({
+      source: { type: "group", groupId: "group-1", userId: "user-1" }
+    })).toEqual({
+      conversationId: "group-1",
+      senderId: "user-1",
+      sourceType: "group",
+      identityKey: "group-1:user-1"
+    });
+
+    expect(lineScopeFromEvent({
+      source: { type: "room", roomId: "room-2", userId: "user-1" }
+    })?.identityKey).toBe("room-2:user-1");
   });
 });
