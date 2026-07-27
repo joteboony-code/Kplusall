@@ -9,6 +9,19 @@ Cloudflare Worker เดียวสำหรับ LINE OA 5 ภูมิภา
 - R2: `kplusall-slips` (รูปสลิปเป็น private bucket)
 - Queue: `kplusall-ocr-jobs`
 
+## R2 retention
+
+Bucket `kplusall-slips` uses the lifecycle rule
+`kplusall-delete-slips-after-1-day`. The rule applies to every object and
+expires stored LINE images after 1 day. Cloudflare may take up to approximately
+24 additional hours to physically remove an expired object.
+
+ตรวจสอบกฎที่ใช้งานจริง:
+
+```bash
+npx wrangler r2 bucket lifecycle list kplusall-slips
+```
+
 ## กฎ OCR ปัจจุบัน
 
 1. รับเลขงาน 8 หลัก แยกตาม `region + LINE user ID`.
