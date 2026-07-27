@@ -5,6 +5,31 @@ type Env = {
 };
 type RegionConfigRow = { region: Region; enabled: number; line_channel_secret: ArrayBuffer | null; line_channel_token: ArrayBuffer | null; ocrspace_api_key: ArrayBuffer | null };
 type RegionConfig = { region: Region; enabled: boolean; lineSecret: string; lineToken: string; ocrKey: string };
+type OcrResult = "passed" | "silent" | "needs_fallback";
+type OcrAnalysis = {
+  result: OcrResult;
+  foundKplus: boolean;
+  foundSettlement: boolean;
+  matchedAmount: string | null;
+  detectedAmounts: string[];
+  reason: string;
+};
+type OcrLogRow = {
+  id: string;
+  region: Region;
+  job_number: string;
+  status: string;
+  ocr_provider: string | null;
+  result: string | null;
+  found_kplus: number | null;
+  found_settlement: number | null;
+  matched_amount: string | null;
+  detected_amounts: string | null;
+  decision_reason: string | null;
+  ocr_excerpt: string | null;
+  created_at: string;
+  updated_at: string;
+};
 const REGIONS: Region[] = ["north", "central", "isan", "south", "bangkok"];
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -62,14 +87,12 @@ async function lineCall(token: string, endpoint: string, body: unknown) {
   const response = await fetch(`https://api.line.me/v2/bot/${endpoint}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(`LINE ${endpoint}: ${response.status}`);
 }
-function quickReply() { return { items: [{ type: "action", action: { type: "message", label: "ส่งเลขงาน", text: "เลขงาน" } }] }; }
-async function replyText(token: string, replyToken: string, text: string) { await lineCall(token, "message/reply", { replyToken, messages: [{ type: "text", text, quickReply: quickReply() }] }); }
 async function pushPass(token: string, to: string, job: string) {
-  await lineCall(token, "message/push", { to, messages: [{ type: "flex", altText: `งาน ${job}: ผ่าน`, contents: { type: "bubble", body: { type: "box", layout: "vertical", contents: [{ type: "text", text: "ตรวจสอบผ่าน", weight: "bold", size: "xl", color: "#16803c" }, { type: "text", text: `เลขงาน ${job}`, margin: "md" }, { type: "text", text: "พบ KPLUS / SETTLEMENT และยอด 1.22", size: "sm", color: "#666666", margin: "md", wrap: true }] } } }] });
+  await lineCall(token, "message/push", { to, messages: [{ type: "flex", altText: `งาน ${job}: ผ่าน`, contents: { type: "bubble", body: { type: "box", layout: "vertical", contents: [{ type: "text", text: "ตรวจสอบผ่าน", weight: "bold", size: "xl", color: "#16803c" }, { type: "text", text: `เลขงาน ${job}`, margin: "md" }] } } }] });
 }
 async function validSignature(raw: string, signature: string | null, secret: string) { return Boolean(signature) && await safeEqual(await hmac(raw, secret), signature!); }
 
-async function webhook(request: Request, env: Env, region: Region, ctx: ExecutionContext) {
+async function webhook(request: Request, env: Env, region: Region) {
   let c: RegionConfig;
   try { c = await config(env, region); } catch { return json({ error: "control secrets not initialized" }, 503); }
   if (!c.enabled || !c.lineSecret || !c.lineToken || !c.ocrKey) return json({ error: "region is not configured" }, 503);
@@ -81,17 +104,16 @@ async function webhook(request: Request, env: Env, region: Region, ctx: Executio
     const userId = event.source.userId as string;
     if (event.message?.type === "text") {
       const job = String(event.message.text ?? "").trim();
-      if (!/^\d{8}$/.test(job)) { ctx.waitUntil(replyText(c.lineToken, event.replyToken, "กรุณาส่งเลขงาน 8 หลัก แล้วส่งรูปสลิป")); continue; }
+      if (!/^\d{8}$/.test(job)) continue;
       const id = crypto.randomUUID();
       await env.DB.prepare("INSERT INTO user_jobs(id,region,line_user_id,job_number,status) VALUES(?,?,?,?, 'awaiting_image') ON CONFLICT(region,line_user_id,job_number) DO UPDATE SET status='awaiting_image',updated_at=CURRENT_TIMESTAMP")
         .bind(id, region, userId, job).run();
       await audit(env, "job_received", job, region);
-      ctx.waitUntil(replyText(c.lineToken, event.replyToken, `รับเลขงาน ${job} แล้ว กรุณาส่งรูปสลิป`));
       continue;
     }
     if (event.message?.type !== "image") continue;
     const parent = await env.DB.prepare("SELECT id,job_number FROM user_jobs WHERE region=? AND line_user_id=? AND status='awaiting_image' ORDER BY updated_at DESC LIMIT 1").bind(region, userId).first<{ id: string; job_number: string }>();
-    if (!parent) { ctx.waitUntil(replyText(c.lineToken, event.replyToken, "กรุณาส่งเลขงาน 8 หลักก่อนส่งรูป")); continue; }
+    if (!parent) continue;
     const content = await fetch(`https://api-data.line.me/v2/bot/message/${event.message.id}/content`, { headers: { authorization: `Bearer ${c.lineToken}` } });
     if (!content.ok || !content.body) { await audit(env, "line_image_download_failed", String(content.status), region); continue; }
     const id = crypto.randomUUID(); const r2Key = `${region}/${today()}/${id}.jpg`;
@@ -100,16 +122,27 @@ async function webhook(request: Request, env: Env, region: Region, ctx: Executio
     await env.DB.prepare("UPDATE user_jobs SET status='image_queued',updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(parent.id).run();
     await env.OCR_JOBS.send({ id, region });
     await audit(env, "image_queued", parent.job_number, region);
-    ctx.waitUntil(replyText(c.lineToken, event.replyToken, "รับรูปแล้ว กำลังตรวจสอบ"));
   }
   return new Response("OK");
 }
 
-export function classify(text: string) {
+export function analyzeOcr(text: string): OcrAnalysis {
   const upper = text.toUpperCase();
-  if (!upper.includes("KPLUS") || !upper.includes("SETTLEMENT")) return "silent";
-  return /(^|[^0-9])-?1\.22([^0-9]|$)/.test(text) ? "passed" : "needs_fallback";
+  const foundKplus = upper.includes("KPLUS");
+  const foundSettlement = upper.includes("SETTLEMENT");
+  const target = text.match(/(^|[^0-9])(-?1\.22)([^0-9]|$)/);
+  const matchedAmount = target?.[2] ?? null;
+  const detectedAmounts = [...new Set((text.match(/-?\d+(?:[.,]\d{1,2})?/g) ?? []).map((value) => value.replace(",", ".")))].slice(0, 12);
+  if (!foundKplus || !foundSettlement) {
+    const missing = [!foundKplus ? "KPLUS" : "", !foundSettlement ? "SETTLEMENT" : ""].filter(Boolean).join(" และ ");
+    return { result: "silent", foundKplus, foundSettlement, matchedAmount, detectedAmounts, reason: `ไม่พบ ${missing} จึงไม่แจ้ง LINE` };
+  }
+  if (matchedAmount) {
+    return { result: "passed", foundKplus, foundSettlement, matchedAmount, detectedAmounts, reason: `พบ KPLUS, SETTLEMENT และยอด ${matchedAmount}` };
+  }
+  return { result: "needs_fallback", foundKplus, foundSettlement, matchedAmount, detectedAmounts, reason: "พบ KPLUS และ SETTLEMENT แต่ไม่พบยอด 1.22 หรือ -1.22" };
 }
+export function classify(text: string) { return analyzeOcr(text).result; }
 async function processJob(env: Env, data: { id: string; region: Region }) {
   const row = await env.DB.prepare("SELECT s.*,u.job_number FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?").bind(data.id, data.region).first<any>();
   if (!row || row.status !== "queued") return;
@@ -123,14 +156,40 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
   const text = (payload.ParsedResults ?? []).map((v: any) => v.ParsedText ?? "").join("\n");
   const succeeded = response.ok && !payload.IsErroredOnProcessing;
   await usage(env, data.region, succeeded);
-  if (!succeeded) { await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',ocr_provider='ocrspace',ocr_text=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(String(payload.ErrorMessage ?? response.status), row.id).run(); await audit(env, "ocr_error", String(payload.ErrorMessage ?? response.status), data.region); return; }
-  const result = classify(text);
-  await env.DB.prepare("UPDATE slip_jobs SET status=?,ocr_provider='ocrspace',ocr_text=?,result=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(result, text.slice(0, 10000), result, row.id).run();
-  if (result === "passed") {
+  if (!succeeded) {
+    const errorDetail = String(payload.ErrorMessage ?? response.status);
+    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(errorDetail.slice(0, 10000), `OCR.space ผิดพลาด: ${errorDetail}`.slice(0, 1000), row.id).run();
+    await audit(env, "ocr_error", errorDetail, data.region);
+    return;
+  }
+  const analysis = analyzeOcr(text);
+  await env.DB.prepare("UPDATE slip_jobs SET status=?,ocr_provider='ocrspace',ocr_text=?,result=?,found_kplus=?,found_settlement=?,matched_amount=?,detected_amounts=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    .bind(analysis.result, text.slice(0, 10000), analysis.result, analysis.foundKplus ? 1 : 0, analysis.foundSettlement ? 1 : 0, analysis.matchedAmount, JSON.stringify(analysis.detectedAmounts), analysis.reason, row.id).run();
+  if (analysis.result === "passed") {
     const changed = await env.DB.prepare("UPDATE slip_jobs SET replied_at=CURRENT_TIMESTAMP WHERE id=? AND replied_at IS NULL").bind(row.id).run();
     if ((changed.meta.changes ?? 0) === 1) await pushPass(c.lineToken, row.line_user_id, row.job_number);
   }
-  await audit(env, `ocr_${result}`, row.job_number, data.region);
+  await audit(env, `ocr_${analysis.result}`, row.job_number, data.region);
+}
+
+function decodeAmounts(value: string | null) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String).slice(0, 12) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function cleanupOldLogs(env: Env) {
+  const results = await env.DB.batch([
+    env.DB.prepare("DELETE FROM audit_logs WHERE created_at < datetime('now','-30 days')"),
+    env.DB.prepare("DELETE FROM slip_jobs WHERE created_at < datetime('now','-30 days')"),
+    env.DB.prepare("DELETE FROM user_jobs WHERE updated_at < datetime('now','-30 days') AND NOT EXISTS (SELECT 1 FROM slip_jobs WHERE slip_jobs.parent_job_id=user_jobs.id)")
+  ]);
+  console.log(JSON.stringify({ event: "retention_cleanup", retentionDays: 30, changes: results.map((result) => result.meta.changes ?? 0) }));
 }
 
 export function dashboardHtml() { return `<!doctype html>
@@ -187,7 +246,11 @@ export function dashboardHtml() { return `<!doctype html>
     .loading{grid-column:1/-1;text-align:center;padding:48px;border-radius:25px;background:rgba(255,255,255,.7);color:var(--muted)}
     .spinner{display:inline-block;width:25px;height:25px;margin-bottom:8px;border:3px solid #e8def7;border-top-color:var(--purple);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
     .toast{position:fixed;right:22px;bottom:22px;z-index:20;padding:13px 17px;border-radius:14px;color:white;background:#342d48;box-shadow:0 14px 34px rgba(45,39,65,.25);opacity:0;transform:translateY(15px);pointer-events:none;transition:.25s}.toast.show{opacity:1;transform:none}.toast.error{background:#b94561}
-    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}}
+    .log-panel{padding:20px;border:1px solid rgba(255,255,255,.92);border-radius:25px;background:rgba(255,255,255,.82);box-shadow:0 16px 40px rgba(73,55,108,.09);backdrop-filter:blur(14px)}
+    .log-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.log-tabs{display:flex;flex-wrap:wrap;gap:8px}.log-tab,.refresh-logs{padding:9px 13px;border:1px solid var(--line);border-radius:999px;background:white;color:var(--ink);font-weight:750;cursor:pointer}.log-tab.active{border-color:transparent;color:white;background:linear-gradient(100deg,var(--pink),var(--purple));box-shadow:0 7px 18px rgba(139,92,246,.2)}.refresh-logs{border-radius:12px}
+    .log-list{display:grid;gap:11px}.log-row{padding:16px;border:1px solid var(--line);border-radius:18px;background:#fff}.log-main{display:grid;grid-template-columns:minmax(105px,.8fr) minmax(115px,.9fr) minmax(100px,.8fr) minmax(0,2.5fr);gap:13px;align-items:center}.log-cell small{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.log-cell strong{display:block;margin-top:2px;font-size:13px;overflow-wrap:anywhere}.status-pill{display:inline-flex!important;width:max-content;padding:5px 9px;border-radius:999px}.status-passed{color:#167b59;background:#e7f7f0}.status-silent{color:#756b85;background:#f1eef5}.status-fallback{color:#a86618;background:#fff2dc}.status-error{color:#ae3c57;background:#ffe8ee}.status-queued{color:#6652a2;background:#eee9ff}
+    .log-facts{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}.fact{padding:5px 8px;border-radius:9px;background:#f8f5fb;color:#5f5770;font-size:11px}.fact.yes{color:#167b59;background:#eaf8f2}.fact.no{color:#ad4059;background:#fff0f3}.ocr-detail{margin-top:11px;color:var(--muted);font-size:12px}.ocr-detail summary{cursor:pointer;font-weight:700;color:#6e518e}.ocr-text{margin:8px 0 0;padding:11px;border-radius:11px;background:#f8f6fb;white-space:pre-wrap;overflow-wrap:anywhere}.empty-logs{text-align:center;padding:44px;color:var(--muted)}
+    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.log-toolbar{align-items:stretch;flex-direction:column}.refresh-logs{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}}
   </style>
 </head>
 <body>
@@ -202,13 +265,25 @@ export function dashboardHtml() { return `<!doctype html>
     </section>
     <div class="section-head"><div><h2>ตั้งค่าระบบแต่ละภูมิภาค</h2><p>กรอกเฉพาะค่าที่ต้องการเปลี่ยน ค่าเดิมจะไม่ถูกแสดงกลับมา</p></div><div class="secure-note">🔒 Secret เข้ารหัสแล้ว</div></div>
     <section class="grid" id="app"><div class="loading"><span class="spinner"></span><br>กำลังโหลดข้อมูล...</div></section>
+    <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">🔄 อัปเดตทุก 30 วินาที</div></div>
+    <section class="log-panel">
+      <div class="log-toolbar"><div class="log-tabs" id="log-tabs"></div><button class="refresh-logs" id="refresh-logs">รีเฟรช Log</button></div>
+      <div class="log-list" id="log-list"><div class="empty-logs"><span class="spinner"></span><br>กำลังโหลด Log...</div></div>
+    </section>
   </main>
   <div class="toast" id="toast"></div>
   <script>
     const regions=['north','central','isan','south','bangkok'];
     const meta={north:{name:'ภาคเหนือ',icon:'⛰️'},central:{name:'ภาคกลาง',icon:'🌾'},isan:{name:'ภาคอีสาน',icon:'☀️'},south:{name:'ภาคใต้',icon:'🌊'},bangkok:{name:'กรุงเทพฯ',icon:'🏙️'}};
     const app=document.querySelector('#app');
+    const logList=document.querySelector('#log-list');
+    const logTabs=document.querySelector('#log-tabs');
+    let activeLogRegion='north';
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
+    function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
+    function formatTime(value){if(!value)return '—';const date=new Date(String(value).replace(' ','T')+'Z');return Number.isNaN(date.getTime())?value:date.toLocaleString('th-TH',{dateStyle:'short',timeStyle:'short'})}
+    function statusInfo(item){const key=item.result||item.status;return {passed:['ผ่าน','status-passed'],silent:['เงียบ','status-silent'],needs_fallback:['รอ OCR สำรอง','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
+    function fact(label,value){const state=value===null?'':(value?' yes':' no');const text=value===null?'—':(value?'พบ':'ไม่พบ');return '<span class="fact'+state+'">'+label+': '+text+'</span>'}
     function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
     async function load(){
       const response=await fetch('/admin/api/config');
@@ -231,7 +306,27 @@ export function dashboardHtml() { return `<!doctype html>
       const response=await fetch('/admin/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
       if(response.ok){notify('บันทึก '+meta[region].name+' เรียบร้อยแล้ว');await load()}else{let message='บันทึกไม่สำเร็จ (HTTP '+response.status+')';try{const result=await response.json();if(result&&result.error)message=result.error}catch{}notify(message,true);button.disabled=false;button.textContent='บันทึก '+meta[region].name}
     }
+    function renderLogs(items){
+      if(!items.length){logList.innerHTML='<div class="empty-logs">ยังไม่มีประวัติการตรวจของ '+meta[activeLogRegion].name+'</div>';return}
+      logList.innerHTML=items.map(item=>{
+        const status=statusInfo(item);const amounts=item.matchedAmount||((item.detectedAmounts||[]).join(', '))||'ไม่พบ';
+        const detail=item.ocrExcerpt?'<details class="ocr-detail"><summary>ดูข้อความ OCR บางส่วน</summary><pre class="ocr-text">'+escapeHtml(item.ocrExcerpt)+'</pre></details>':'';
+        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(item.provider==='ocrspace'?'OCR.space':(item.provider||'รอระบุ'))+'</span>'+fact('KPLUS',item.foundKplus)+fact('SETTLEMENT',item.foundSettlement)+'<span class="fact">ยอดที่พบ: '+escapeHtml(amounts)+'</span></div>'+detail+'</article>'
+      }).join('')
+    }
+    async function loadLogs(){
+      logList.innerHTML='<div class="empty-logs"><span class="spinner"></span><br>กำลังโหลด Log...</div>';
+      const response=await fetch('/admin/api/logs?region='+encodeURIComponent(activeLogRegion));
+      if(response.status===401){location='/admin';return}
+      if(!response.ok)throw new Error('โหลด Log ไม่สำเร็จ');
+      renderLogs(await response.json())
+    }
+    logTabs.innerHTML=regions.map(region=>'<button class="log-tab '+(region===activeLogRegion?'active':'')+'" data-log-region="'+region+'">'+meta[region].name+'</button>').join('');
+    logTabs.querySelectorAll('.log-tab').forEach(button=>button.addEventListener('click',async()=>{activeLogRegion=button.dataset.logRegion;logTabs.querySelectorAll('.log-tab').forEach(tab=>tab.classList.toggle('active',tab===button));try{await loadLogs()}catch{notify('โหลด Log ไม่สำเร็จ',true)}}));
+    document.querySelector('#refresh-logs').addEventListener('click',()=>loadLogs().catch(()=>notify('โหลด Log ไม่สำเร็จ',true)));
     load().catch(()=>{app.innerHTML='<div class="loading">โหลดข้อมูลไม่สำเร็จ กรุณารีเฟรชหน้าอีกครั้ง</div>';notify('โหลดข้อมูลไม่สำเร็จ',true)});
+    loadLogs().catch(()=>{logList.innerHTML='<div class="empty-logs">โหลด Log ไม่สำเร็จ กรุณารีเฟรชอีกครั้ง</div>';notify('โหลด Log ไม่สำเร็จ',true)});
+    setInterval(()=>loadLogs().catch(()=>{}),30000);
   </script>
 </body>
 </html>`; }
@@ -257,6 +352,28 @@ async function admin(request: Request, env: Env, url: URL) {
   const token = cookie(request, "kplusall_admin"); const [body, sig] = token?.split(".") ?? []; const payload = body ? dec.decode(unb64(body)) : "";
   if (!sig || !(await safeEqual(sig, await hmac(payload, env.CONFIG_ENCRYPTION_KEY))) || Number(payload) < Date.now()) return new Response(loginHtml(), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
   if (url.pathname === "/admin/api/config" && request.method === "GET") { const rows = await env.DB.prepare("SELECT region,enabled,line_channel_secret,line_channel_token,ocrspace_api_key FROM region_config ORDER BY region").all<RegionConfigRow>(); return json(rows.results.map((r) => ({ region:r.region, enabled:Boolean(r.enabled), hasLineSecret:Boolean(r.line_channel_secret), hasLineToken:Boolean(r.line_channel_token), hasOcrKey:Boolean(r.ocrspace_api_key) }))); }
+  if (url.pathname === "/admin/api/logs" && request.method === "GET") {
+    const region = url.searchParams.get("region") ?? "north";
+    if (!isRegion(region)) return json({ error:"invalid region" }, 400);
+    const rows = await env.DB.prepare("SELECT s.id,s.region,u.job_number,s.status,s.ocr_provider,s.result,s.found_kplus,s.found_settlement,s.matched_amount,s.detected_amounts,s.decision_reason,substr(s.ocr_text,1,500) AS ocr_excerpt,s.created_at,s.updated_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.region=? ORDER BY s.created_at DESC LIMIT 50")
+      .bind(region).all<OcrLogRow>();
+    return json(rows.results.map((row) => ({
+      id: row.id,
+      region: row.region,
+      jobNumber: row.job_number,
+      status: row.status,
+      provider: row.ocr_provider,
+      result: row.result,
+      foundKplus: row.found_kplus === null ? null : Boolean(row.found_kplus),
+      foundSettlement: row.found_settlement === null ? null : Boolean(row.found_settlement),
+      matchedAmount: row.matched_amount,
+      detectedAmounts: decodeAmounts(row.detected_amounts),
+      reason: row.decision_reason,
+      ocrExcerpt: row.ocr_excerpt,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    })));
+  }
   if (url.pathname === "/admin/api/config" && request.method === "POST") {
     try {
       const input = await request.json<any>();
@@ -279,10 +396,11 @@ async function admin(request: Request, env: Env, url: URL) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/webhook/")) { const region = url.pathname.split("/")[2]; if (!isRegion(region) || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region, ctx); }
+    if (url.pathname.startsWith("/webhook/")) { const region = url.pathname.split("/")[2]; if (!isRegion(region) || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region); }
     if (url.pathname.startsWith("/admin")) return admin(request, env, url);
     if (url.pathname === "/health") return json({ ok:true, service:"kplusall" });
     return new Response("Kplusall Worker", { status:200 });
   },
-  async queue(batch, env) { for (const message of batch.messages) { try { await processJob(env, message.body as { id:string; region:Region }); message.ack(); } catch (error) { await audit(env,"queue_error",error instanceof Error ? error.message : String(error)); message.retry(); } } }
+  async queue(batch, env) { for (const message of batch.messages) { try { await processJob(env, message.body as { id:string; region:Region }); message.ack(); } catch (error) { await audit(env,"queue_error",error instanceof Error ? error.message : String(error)); message.retry(); } } },
+  async scheduled(_controller, env, ctx) { ctx.waitUntil(cleanupOldLogs(env)); }
 } satisfies ExportedHandler<Env>;

@@ -27,6 +27,18 @@ describe("control dashboard", () => {
     expect(html).toContain("@media(max-width:760px)");
   });
 
+  it("renders regional OCR logs with result details and refresh controls", () => {
+    const html = dashboardHtml();
+
+    expect(html).toContain("ประวัติการตรวจ OCR");
+    expect(html).toContain('id="log-tabs"');
+    expect(html).toContain('id="refresh-logs"');
+    expect(html).toContain("/admin/api/logs?region=");
+    expect(html).toContain("ตรวจด้วย:");
+    expect(html).toContain("ยอดที่พบ:");
+    expect(html).toContain("setInterval");
+  });
+
   it("uses the matching themed login page", () => {
     const html = loginHtml();
 
