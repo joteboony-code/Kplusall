@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "kplusall",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-27",
+  "workers_dev": true,
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kplusall-db",
+      "database_id": "34862835-5fae-4ed2-b7f4-eaefa6e9e4d1",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "SLIPS", "bucket_name": "kplusall-slips" }
+  ],
+  "queues": {
+    "producers": [{ "binding": "OCR_JOBS", "queue": "kplusall-ocr-jobs" }],
+    "consumers": [{ "queue": "kplusall-ocr-jobs", "max_batch_size": 1, "max_retries": 3 }]
+  }
+}

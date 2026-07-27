@@ -1,0 +1,50 @@
+# Kplusall
+
+Cloudflare Worker เดียวสำหรับ LINE OA 5 ภูมิภาค: `north`, `central`, `isan`, `south`, `bangkok`.
+
+## ทรัพยากรที่สร้างแล้ว
+
+- Worker: `kplusall`
+- D1: `kplusall-db` (APAC)
+- R2: `kplusall-slips` (รูปสลิปเป็น private bucket)
+- Queue: `kplusall-ocr-jobs`
+
+## กฎ OCR ปัจจุบัน
+
+1. รับเลขงาน 8 หลัก แยกตาม `region + LINE user ID`.
+2. รูปถูกบันทึก private ใน R2 แล้วส่งเข้าคิว.
+3. ใช้ OCR.space ของ region นั้นเท่านั้น.
+4. มี `KPLUS` และ `SETTLEMENT` และพบ `1.22` หรือ `-1.22` => `passed`.
+5. ขาด `KPLUS` หรือ `SETTLEMENT` => `silent` (ไม่ตอบ).
+6. มีทั้งสองคำแต่ยอดไม่ตรง => `needs_fallback` (ยังไม่เรียก provider อื่น).
+
+## Deploy ครั้งแรก
+
+```bash
+npm install
+npx wrangler d1 migrations apply kplusall-db --remote
+npx wrangler deploy
+```
+
+ตั้ง Secrets สองตัวก่อนเปิดหน้า Control (อย่า commit ค่าเหล่านี้):
+
+```bash
+# สร้างค่า base64 random 32 bytes สำหรับเข้ารหัส config
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+npx wrangler secret put CONFIG_ENCRYPTION_KEY
+npx wrangler secret put ADMIN_PASSWORD
+```
+
+จากนั้นเปิด `https://kplusall.<your-subdomain>.workers.dev/admin` แล้ว login เพื่อกรอก LINE Channel Secret, Channel Access Token และ OCR.space API Key ของแต่ละภาค ระบบเก็บค่าที่เข้ารหัสใน D1 และไม่แสดงค่าเดิมกลับบนหน้าเว็บ
+
+Webhook URL:
+
+```text
+/webhook/north
+/webhook/central
+/webhook/isan
+/webhook/south
+/webhook/bangkok
+```
+
+LINE reply token ใช้ตอบรับว่าได้รับรูปทันที ส่วนผลคิวที่เสร็จภายหลังใช้ Push API เพราะ reply token เป็นครั้งเดียวและอาจหมดอายุระหว่างรอ Queue.
