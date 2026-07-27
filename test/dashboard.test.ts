@@ -33,6 +33,8 @@ describe("control dashboard", () => {
     expect(html).toContain("ประวัติการตรวจ OCR");
     expect(html).toContain('id="log-tabs"');
     expect(html).toContain('id="refresh-logs"');
+    expect(html).toContain('id="requeue-stuck"');
+    expect(html).toContain("/admin/api/requeue-stuck");
     expect(html).toContain("/admin/api/logs?region=");
     expect(html).toContain("ตรวจด้วย:");
     expect(html).toContain("ยอดที่พบ:");
