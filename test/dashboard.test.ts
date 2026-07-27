@@ -36,6 +36,8 @@ describe("control dashboard", () => {
     expect(html).toContain("/admin/api/logs?region=");
     expect(html).toContain("ตรวจด้วย:");
     expect(html).toContain("ยอดที่พบ:");
+    expect(html).toContain("รูปในชุด:");
+    expect(html).toContain("KPLUS/K+");
     expect(html).toContain("setInterval");
   });
 

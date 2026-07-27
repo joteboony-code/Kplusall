@@ -27,12 +27,36 @@ type OcrLogRow = {
   detected_amounts: string | null;
   decision_reason: string | null;
   ocr_excerpt: string | null;
+  image_set_id: string | null;
+  image_set_index: number | null;
+  image_set_total: number | null;
   created_at: string;
   updated_at: string;
+};
+type LineImageSet = { id?: string; index?: number; total?: number };
+type LineEvent = {
+  type?: string;
+  source?: { type?: string; userId?: string };
+  message?: { id?: string; type?: string; text?: string; imageSet?: LineImageSet };
+};
+type ActiveUserJob = { id: string; job_number: string };
+type SlipProcessRow = {
+  id: string;
+  region: Region;
+  parent_job_id: string;
+  line_message_id: string;
+  line_user_id: string;
+  r2_key: string;
+  status: string;
+  job_number: string;
+  pass_sent_at: string | null;
 };
 const REGIONS: Region[] = ["north", "central", "isan", "south", "bangkok"];
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+const JOB_REFERENCE_MINUTES = 30;
+const PASS_CLAIM_MINUTES = 2;
+const OCRSPACE_DAILY_LIMIT = 500;
 
 function json(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } }); }
 function b64(bytes: Uint8Array) { let s = ""; bytes.forEach((b) => s += String.fromCharCode(b)); return btoa(s); }
@@ -79,18 +103,39 @@ async function config(env: Env, region: Region): Promise<RegionConfig> {
   return { region, enabled: Boolean(row.enabled), lineSecret: await open(row.line_channel_secret, env), lineToken: await open(row.line_channel_token, env), ocrKey: await open(row.ocrspace_api_key, env) };
 }
 async function audit(env: Env, event: string, detail: string, region?: Region) { await env.DB.prepare("INSERT INTO audit_logs(region,event_type,detail) VALUES(?,?,?)").bind(region ?? null, event, detail.slice(0, 1000)).run(); }
-async function usage(env: Env, region: Region, success: boolean) {
-  await env.DB.prepare("INSERT INTO daily_usage(usage_date,region,provider,request_count,success_count,error_count) VALUES(?,?, 'ocrspace',1,?,?) ON CONFLICT(usage_date,region,provider) DO UPDATE SET request_count=request_count+1,success_count=success_count+excluded.success_count,error_count=error_count+excluded.error_count")
-    .bind(today(), region, success ? 1 : 0, success ? 0 : 1).run();
+async function reserveOcrSpaceUsage(env: Env, region: Region) {
+  await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,'ocrspace')")
+    .bind(today(), region).run();
+  const reserved = await env.DB.prepare("UPDATE daily_usage SET request_count=request_count+1 WHERE usage_date=? AND region=? AND provider='ocrspace' AND request_count<?")
+    .bind(today(), region, OCRSPACE_DAILY_LIMIT).run();
+  return (reserved.meta.changes ?? 0) === 1;
 }
-async function lineCall(token: string, endpoint: string, body: unknown) {
-  const response = await fetch(`https://api.line.me/v2/bot/${endpoint}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+async function recordOcrSpaceOutcome(env: Env, region: Region, success: boolean) {
+  await env.DB.prepare(`UPDATE daily_usage SET
+      success_count=success_count+?,
+      error_count=error_count+?
+    WHERE usage_date=? AND region=? AND provider='ocrspace'`)
+    .bind(success ? 1 : 0, success ? 0 : 1, today(), region).run();
+}
+async function lineCall(token: string, endpoint: string, body: unknown, retryKey?: string) {
+  const headers: Record<string, string> = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  if (retryKey) headers["x-line-retry-key"] = retryKey;
+  const response = await fetch(`https://api.line.me/v2/bot/${endpoint}`, { method: "POST", headers, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(`LINE ${endpoint}: ${response.status}`);
 }
-async function pushPass(token: string, to: string, job: string) {
-  await lineCall(token, "message/push", { to, messages: [{ type: "flex", altText: `งาน ${job}: ผ่าน`, contents: { type: "bubble", body: { type: "box", layout: "vertical", contents: [{ type: "text", text: "ตรวจสอบผ่าน", weight: "bold", size: "xl", color: "#16803c" }, { type: "text", text: `เลขงาน ${job}`, margin: "md" }] } } }] });
+async function pushPass(token: string, to: string, job: string, retryKey: string) {
+  await lineCall(token, "message/push", { to, messages: [{ type: "flex", altText: `งาน ${job}: ผ่าน`, contents: { type: "bubble", body: { type: "box", layout: "vertical", contents: [{ type: "text", text: "ตรวจสอบผ่าน", weight: "bold", size: "xl", color: "#16803c" }, { type: "text", text: `เลขงาน ${job}`, margin: "md" }] } } }] }, retryKey);
 }
 async function validSignature(raw: string, signature: string | null, secret: string) { return Boolean(signature) && await safeEqual(await hmac(raw, secret), signature!); }
+
+export function imageSetMetadata(event: LineEvent) {
+  const imageSet = event.message?.imageSet;
+  return {
+    id: typeof imageSet?.id === "string" ? imageSet.id : null,
+    index: Number.isInteger(imageSet?.index) ? imageSet!.index! : null,
+    total: Number.isInteger(imageSet?.total) ? imageSet!.total! : null
+  };
+}
 
 async function webhook(request: Request, env: Env, region: Region) {
   let c: RegionConfig;
@@ -98,43 +143,94 @@ async function webhook(request: Request, env: Env, region: Region) {
   if (!c.enabled || !c.lineSecret || !c.lineToken || !c.ocrKey) return json({ error: "region is not configured" }, 503);
   const raw = await request.text();
   if (!(await validSignature(raw, request.headers.get("x-line-signature"), c.lineSecret))) { await audit(env, "signature_invalid", "LINE signature rejected", region); return new Response("Unauthorized", { status: 401 }); }
-  const payload = JSON.parse(raw) as { events?: Array<any> };
+  const payload = JSON.parse(raw) as { events?: LineEvent[] };
   for (const event of payload.events ?? []) {
-    if (event.type !== "message" || event.source?.type !== "user") continue;
-    const userId = event.source.userId as string;
+    if (event.type !== "message" || !event.source?.userId) continue;
+    const userId = event.source.userId;
     if (event.message?.type === "text") {
       const job = String(event.message.text ?? "").trim();
       if (!/^\d{8}$/.test(job)) continue;
       const id = crypto.randomUUID();
-      await env.DB.prepare("INSERT INTO user_jobs(id,region,line_user_id,job_number,status) VALUES(?,?,?,?, 'awaiting_image') ON CONFLICT(region,line_user_id,job_number) DO UPDATE SET status='awaiting_image',updated_at=CURRENT_TIMESTAMP")
-        .bind(id, region, userId, job).run();
+      await env.DB.prepare(`INSERT INTO user_jobs(
+          id,region,line_user_id,job_number,status,expires_at,reference_set_at
+        ) VALUES(?,?,?,?, 'collecting',datetime('now',?),strftime('%Y-%m-%d %H:%M:%f','now'))
+        ON CONFLICT(region,line_user_id,job_number) DO UPDATE SET
+          status=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN 'collecting' ELSE user_jobs.status END,
+          pass_claimed_at=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN NULL ELSE user_jobs.pass_claimed_at END,
+          pass_claim_token=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN NULL ELSE user_jobs.pass_claim_token END,
+          pass_sent_at=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN NULL ELSE user_jobs.pass_sent_at END,
+          expires_at=datetime('now',?),
+          reference_set_at=strftime('%Y-%m-%d %H:%M:%f','now'),
+          updated_at=CURRENT_TIMESTAMP`)
+        .bind(id, region, userId, job, `+${JOB_REFERENCE_MINUTES} minutes`, `+${JOB_REFERENCE_MINUTES} minutes`).run();
       await audit(env, "job_received", job, region);
       continue;
     }
-    if (event.message?.type !== "image") continue;
-    const parent = await env.DB.prepare("SELECT id,job_number FROM user_jobs WHERE region=? AND line_user_id=? AND status='awaiting_image' ORDER BY updated_at DESC LIMIT 1").bind(region, userId).first<{ id: string; job_number: string }>();
-    if (!parent) continue;
-    const content = await fetch(`https://api-data.line.me/v2/bot/message/${event.message.id}/content`, { headers: { authorization: `Bearer ${c.lineToken}` } });
-    if (!content.ok || !content.body) { await audit(env, "line_image_download_failed", String(content.status), region); continue; }
-    const id = crypto.randomUUID(); const r2Key = `${region}/${today()}/${id}.jpg`;
-    await env.SLIPS.put(r2Key, content.body, { httpMetadata: { contentType: content.headers.get("content-type") ?? "image/jpeg" } });
-    await env.DB.prepare("INSERT INTO slip_jobs(id,region,parent_job_id,line_message_id,line_user_id,r2_key) VALUES(?,?,?,?,?,?)").bind(id, region, parent.id, event.message.id, userId, r2Key).run();
-    await env.DB.prepare("UPDATE user_jobs SET status='image_queued',updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(parent.id).run();
+    if (event.message?.type !== "image" || !event.message.id) continue;
+    const parent = await env.DB.prepare("SELECT id,job_number FROM user_jobs WHERE region=? AND line_user_id=? AND expires_at>CURRENT_TIMESTAMP ORDER BY reference_set_at DESC,rowid DESC LIMIT 1")
+      .bind(region, userId).first<ActiveUserJob>();
+    if (!parent) {
+      await audit(env, "image_ignored_no_active_job", event.message.id, region);
+      continue;
+    }
+    const messageId = event.message.id;
+    const id = crypto.randomUUID();
+    const r2Key = `${region}/${today()}/${id}.jpg`;
+    const imageSet = imageSetMetadata(event);
+    const inserted = await env.DB.prepare(`INSERT INTO slip_jobs(
+        id,region,parent_job_id,line_message_id,line_user_id,r2_key,
+        image_set_id,image_set_index,image_set_total
+      ) VALUES(?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(region,line_message_id) DO NOTHING`)
+      .bind(id, region, parent.id, messageId, userId, r2Key, imageSet.id, imageSet.index, imageSet.total).run();
+    if ((inserted.meta.changes ?? 0) !== 1) {
+      const duplicate = await env.DB.prepare("SELECT id,status FROM slip_jobs WHERE region=? AND line_message_id=?")
+        .bind(region, messageId).first<{ id: string; status: string }>();
+      if (duplicate?.status === "queued") {
+        await env.OCR_JOBS.send({ id: duplicate.id, region });
+      }
+      await audit(env, "image_duplicate_ignored", messageId, region);
+      continue;
+    }
     await env.OCR_JOBS.send({ id, region });
-    await audit(env, "image_queued", parent.job_number, region);
+    await audit(env, "image_queued", `${parent.job_number}${imageSet.total ? ` รูป ${imageSet.index ?? "?"}/${imageSet.total}` : ""}`, region);
   }
   return new Response("OK");
 }
 
+function normalizeOcrText(text: string) {
+  return text
+    .toUpperCase()
+    .replace(/\r/g, "\n")
+    .replace(/[‐‑‒–—−]/g, "-")
+    .replace(/-\s*THB\s*/g, "THB -")
+    .replace(/THB\s*-\s*/g, "THB -")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function receiptAmounts(text: string) {
+  const normalized = normalizeOcrText(text);
+  return [...new Set(
+    [...normalized.matchAll(/(?:THB\s*)?(-?\d+[.,]\d{2})\b/g)]
+      .map((match) => Number(match[1].replace(",", ".")))
+      .filter(Number.isFinite)
+  )];
+}
+
 export function analyzeOcr(text: string): OcrAnalysis {
-  const upper = text.toUpperCase();
-  const foundKplus = upper.includes("KPLUS");
-  const foundSettlement = upper.includes("SETTLEMENT");
-  const target = text.match(/(^|[^0-9])(-?1\.22)([^0-9]|$)/);
-  const matchedAmount = target?.[2] ?? null;
-  const detectedAmounts = [...new Set((text.match(/-?\d+(?:[.,]\d{1,2})?/g) ?? []).map((value) => value.replace(",", ".")))].slice(0, 12);
+  const normalized = normalizeOcrText(text);
+  const foundKplus =
+    /\bKPLUS\b/.test(normalized) ||
+    /(?:^|[^A-Z0-9])K\s*\+(?:[^A-Z0-9]|$)/.test(normalized) ||
+    /\b(?:THAI\s*QR(?:\s*PAYMENT)?|QR\s*PAYMENT)\b/.test(normalized);
+  const foundSettlement = /\bSETTLEMENT\b/.test(normalized);
+  const amounts = receiptAmounts(text);
+  const matched = amounts.find((amount) => Math.abs(Math.abs(amount) - 1.22) < 0.005);
+  const matchedAmount = matched === undefined ? null : matched.toFixed(2);
+  const detectedAmounts = amounts.slice(0, 12).map((amount) => amount.toFixed(2));
   if (!foundKplus || !foundSettlement) {
-    const missing = [!foundKplus ? "KPLUS" : "", !foundSettlement ? "SETTLEMENT" : ""].filter(Boolean).join(" และ ");
+    const missing = [!foundKplus ? "KPLUS/K+" : "", !foundSettlement ? "SETTLEMENT" : ""].filter(Boolean).join(" และ ");
     return { result: "silent", foundKplus, foundSettlement, matchedAmount, detectedAmounts, reason: `ไม่พบ ${missing} จึงไม่แจ้ง LINE` };
   }
   if (matchedAmount) {
@@ -143,19 +239,87 @@ export function analyzeOcr(text: string): OcrAnalysis {
   return { result: "needs_fallback", foundKplus, foundSettlement, matchedAmount, detectedAmounts, reason: "พบ KPLUS และ SETTLEMENT แต่ไม่พบยอด 1.22 หรือ -1.22" };
 }
 export function classify(text: string) { return analyzeOcr(text).result; }
+
+async function deliverPass(env: Env, row: SlipProcessRow, token: string) {
+  if (row.pass_sent_at) return;
+  const claimToken = crypto.randomUUID();
+  const claimed = await env.DB.prepare(`UPDATE user_jobs SET
+      status='pass_claimed',
+      pass_claimed_at=CURRENT_TIMESTAMP,
+      pass_claim_token=?
+    WHERE id=? AND pass_sent_at IS NULL AND (
+      pass_claimed_at IS NULL OR
+      pass_claimed_at<datetime('now',?)
+    )`)
+    .bind(claimToken, row.parent_job_id, `-${PASS_CLAIM_MINUTES} minutes`).run();
+  if ((claimed.meta.changes ?? 0) !== 1) {
+    const state = await env.DB.prepare("SELECT pass_sent_at FROM user_jobs WHERE id=?")
+      .bind(row.parent_job_id).first<{ pass_sent_at: string | null }>();
+    if (state?.pass_sent_at) return;
+    throw new Error("pass delivery claim is busy");
+  }
+  try {
+    await pushPass(token, row.line_user_id, row.job_number, row.parent_job_id);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE user_jobs SET status='passed',pass_sent_at=CURRENT_TIMESTAMP,pass_claimed_at=NULL,pass_claim_token=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND pass_claim_token=?")
+        .bind(row.parent_job_id, claimToken),
+      env.DB.prepare("UPDATE slip_jobs SET replied_at=CURRENT_TIMESTAMP WHERE id=? AND replied_at IS NULL")
+        .bind(row.id)
+    ]);
+  } catch (error) {
+    await env.DB.prepare("UPDATE user_jobs SET status='collecting',pass_claimed_at=NULL,pass_claim_token=NULL WHERE id=? AND pass_claim_token=? AND pass_sent_at IS NULL")
+      .bind(row.parent_job_id, claimToken).run();
+    throw error;
+  }
+}
+
 async function processJob(env: Env, data: { id: string; region: Region }) {
-  const row = await env.DB.prepare("SELECT s.*,u.job_number FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?").bind(data.id, data.region).first<any>();
-  if (!row || row.status !== "queued") return;
+  const row = await env.DB.prepare("SELECT s.*,u.job_number,u.pass_sent_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?")
+    .bind(data.id, data.region).first<SlipProcessRow>();
+  if (!row) return;
   const c = await config(env, data.region); if (!c.enabled || !c.ocrKey || !c.lineToken) throw new Error("region configuration unavailable");
-  const object = await env.SLIPS.get(row.r2_key); if (!object || !("body" in object) || !object.body) throw new Error("image missing from R2");
+  if (row.status === "passed" && !row.pass_sent_at) {
+    await deliverPass(env, row, c.lineToken);
+    return;
+  }
+  if (row.status !== "queued") return;
+  if (row.pass_sent_at) {
+    await env.DB.prepare("UPDATE slip_jobs SET status='suppressed',result='silent',decision_reason='งานนี้แจ้งผลผ่านไปแล้ว จึงไม่ตรวจซ้ำ',updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(row.id).run();
+    await audit(env, "ocr_suppressed_after_pass", row.job_number, data.region);
+    return;
+  }
+  let imageBytes: ArrayBuffer;
+  const object = await env.SLIPS.get(row.r2_key);
+  if (object && "body" in object && object.body) {
+    imageBytes = await new Response(object.body).arrayBuffer();
+  } else {
+    const content = await fetch(`https://api-data.line.me/v2/bot/message/${row.line_message_id}/content`, {
+      headers: { authorization: `Bearer ${c.lineToken}` }
+    });
+    if (!content.ok) {
+      await audit(env, "line_image_download_failed", `${row.job_number}: HTTP ${content.status}`, data.region);
+      throw new Error(`LINE image download failed: HTTP ${content.status}`);
+    }
+    imageBytes = await content.arrayBuffer();
+    await env.SLIPS.put(row.r2_key, imageBytes, {
+      httpMetadata: { contentType: content.headers.get("content-type") ?? "image/jpeg" }
+    });
+  }
   const form = new FormData();
   form.append("apikey", c.ocrKey); form.append("language", "eng"); form.append("isOverlayRequired", "false");
-  form.append("file", await new Response(object.body).blob(), "slip.jpg");
+  form.append("file", new Blob([imageBytes]), "slip.jpg");
+  if (!(await reserveOcrSpaceUsage(env, data.region))) {
+    await env.DB.prepare("UPDATE slip_jobs SET status='quota_exhausted',result='needs_fallback',ocr_provider='ocrspace',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(`OCR.space ของภูมิภาคนี้ครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน`, row.id).run();
+    await audit(env, "ocr_quota_exhausted", row.job_number, data.region);
+    return;
+  }
   const response = await fetch("https://api.ocr.space/parse/image", { method: "POST", body: form });
   const payload = await response.json<any>().catch(() => ({}));
   const text = (payload.ParsedResults ?? []).map((v: any) => v.ParsedText ?? "").join("\n");
   const succeeded = response.ok && !payload.IsErroredOnProcessing;
-  await usage(env, data.region, succeeded);
+  await recordOcrSpaceOutcome(env, data.region, succeeded);
   if (!succeeded) {
     const errorDetail = String(payload.ErrorMessage ?? response.status);
     await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
@@ -167,8 +331,7 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
   await env.DB.prepare("UPDATE slip_jobs SET status=?,ocr_provider='ocrspace',ocr_text=?,result=?,found_kplus=?,found_settlement=?,matched_amount=?,detected_amounts=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
     .bind(analysis.result, text.slice(0, 10000), analysis.result, analysis.foundKplus ? 1 : 0, analysis.foundSettlement ? 1 : 0, analysis.matchedAmount, JSON.stringify(analysis.detectedAmounts), analysis.reason, row.id).run();
   if (analysis.result === "passed") {
-    const changed = await env.DB.prepare("UPDATE slip_jobs SET replied_at=CURRENT_TIMESTAMP WHERE id=? AND replied_at IS NULL").bind(row.id).run();
-    if ((changed.meta.changes ?? 0) === 1) await pushPass(c.lineToken, row.line_user_id, row.job_number);
+    await deliverPass(env, row, c.lineToken);
   }
   await audit(env, `ocr_${analysis.result}`, row.job_number, data.region);
 }
@@ -282,7 +445,7 @@ export function dashboardHtml() { return `<!doctype html>
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
     function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
     function formatTime(value){if(!value)return '—';const date=new Date(String(value).replace(' ','T')+'Z');return Number.isNaN(date.getTime())?value:date.toLocaleString('th-TH',{dateStyle:'short',timeStyle:'short'})}
-    function statusInfo(item){const key=item.result||item.status;return {passed:['ผ่าน','status-passed'],silent:['เงียบ','status-silent'],needs_fallback:['รอ OCR สำรอง','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
+    function statusInfo(item){const key=item.status==='quota_exhausted'?'quota_exhausted':(item.result||item.status);return {passed:['ผ่าน','status-passed'],silent:['เงียบ','status-silent'],needs_fallback:['รอ OCR สำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],suppressed:['หยุดหลังพบรูปผ่าน','status-silent'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
     function fact(label,value){const state=value===null?'':(value?' yes':' no');const text=value===null?'—':(value?'พบ':'ไม่พบ');return '<span class="fact'+state+'">'+label+': '+text+'</span>'}
     function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
     async function load(){
@@ -311,7 +474,8 @@ export function dashboardHtml() { return `<!doctype html>
       logList.innerHTML=items.map(item=>{
         const status=statusInfo(item);const amounts=item.matchedAmount||((item.detectedAmounts||[]).join(', '))||'ไม่พบ';
         const detail=item.ocrExcerpt?'<details class="ocr-detail"><summary>ดูข้อความ OCR บางส่วน</summary><pre class="ocr-text">'+escapeHtml(item.ocrExcerpt)+'</pre></details>':'';
-        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(item.provider==='ocrspace'?'OCR.space':(item.provider||'รอระบุ'))+'</span>'+fact('KPLUS',item.foundKplus)+fact('SETTLEMENT',item.foundSettlement)+'<span class="fact">ยอดที่พบ: '+escapeHtml(amounts)+'</span></div>'+detail+'</article>'
+        const imageSet=item.imageSetTotal?'<span class="fact">รูปในชุด: '+escapeHtml((item.imageSetIndex??'?')+'/'+item.imageSetTotal)+'</span>':'';
+        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(item.provider==='ocrspace'?'OCR.space':(item.provider||'รอระบุ'))+'</span>'+imageSet+fact('KPLUS/K+',item.foundKplus)+fact('SETTLEMENT',item.foundSettlement)+'<span class="fact">ยอดที่พบ: '+escapeHtml(amounts)+'</span></div>'+detail+'</article>'
       }).join('')
     }
     async function loadLogs(){
@@ -355,7 +519,7 @@ async function admin(request: Request, env: Env, url: URL) {
   if (url.pathname === "/admin/api/logs" && request.method === "GET") {
     const region = url.searchParams.get("region") ?? "north";
     if (!isRegion(region)) return json({ error:"invalid region" }, 400);
-    const rows = await env.DB.prepare("SELECT s.id,s.region,u.job_number,s.status,s.ocr_provider,s.result,s.found_kplus,s.found_settlement,s.matched_amount,s.detected_amounts,s.decision_reason,substr(s.ocr_text,1,500) AS ocr_excerpt,s.created_at,s.updated_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.region=? ORDER BY s.created_at DESC LIMIT 50")
+    const rows = await env.DB.prepare("SELECT s.id,s.region,u.job_number,s.status,s.ocr_provider,s.result,s.found_kplus,s.found_settlement,s.matched_amount,s.detected_amounts,s.decision_reason,substr(s.ocr_text,1,500) AS ocr_excerpt,s.image_set_id,s.image_set_index,s.image_set_total,s.created_at,s.updated_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.region=? ORDER BY s.created_at DESC LIMIT 50")
       .bind(region).all<OcrLogRow>();
     return json(rows.results.map((row) => ({
       id: row.id,
@@ -370,6 +534,9 @@ async function admin(request: Request, env: Env, url: URL) {
       detectedAmounts: decodeAmounts(row.detected_amounts),
       reason: row.decision_reason,
       ocrExcerpt: row.ocr_excerpt,
+      imageSetId: row.image_set_id,
+      imageSetIndex: row.image_set_index,
+      imageSetTotal: row.image_set_total,
       createdAt: row.created_at,
       updatedAt: row.updated_at
     })));
