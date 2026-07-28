@@ -42,7 +42,7 @@ type OcrLogRow = {
   created_at: string;
   updated_at: string;
 };
-type DailyUsageRow = { provider: string; request_count: number; success_count: number; error_count: number };
+type DailyUsageRow = { region?: Region; provider: string; request_count: number; success_count: number; error_count: number };
 type LineImageSet = { id?: string; index?: number; total?: number };
 type LineEvent = {
   type?: string;
@@ -825,10 +825,12 @@ export function dashboardHtml() { return `<!doctype html>
     .toast{position:fixed;right:22px;bottom:22px;z-index:20;padding:13px 17px;border-radius:14px;color:white;background:#342d48;box-shadow:0 14px 34px rgba(45,39,65,.25);opacity:0;transform:translateY(15px);pointer-events:none;transition:.25s}.toast.show{opacity:1;transform:none}.toast.error{background:#b94561}
     .log-panel{padding:20px;border:1px solid rgba(255,255,255,.92);border-radius:25px;background:rgba(255,255,255,.82);box-shadow:0 16px 40px rgba(73,55,108,.09);backdrop-filter:blur(14px)}
     .log-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.log-tabs,.log-actions{display:flex;flex-wrap:wrap;gap:8px}.log-tab,.refresh-logs,.requeue-stuck{padding:9px 13px;border:1px solid var(--line);border-radius:999px;background:white;color:var(--ink);font-weight:750;cursor:pointer}.log-tab.active{border-color:transparent;color:white;background:linear-gradient(100deg,var(--pink),var(--purple));box-shadow:0 7px 18px rgba(139,92,246,.2)}.refresh-logs,.requeue-stuck{border-radius:12px}.requeue-stuck{color:#7852bb;background:#f6f1ff}
-    .usage-summary{display:flex;flex-wrap:wrap;gap:9px;margin:-3px 0 16px}.usage-card{padding:8px 11px;border:1px solid var(--line);border-radius:12px;background:#faf8fd;color:var(--muted);font-size:12px}.usage-card strong{color:var(--ink)}
+    .ocr-usage-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}.ocr-usage-region{padding:16px;border:1px solid var(--line);border-radius:20px;background:rgba(255,255,255,.84);box-shadow:0 10px 28px rgba(73,55,108,.07)}.ocr-usage-region h3{margin:0 0 12px;font-size:14px}.ocr-provider-count{display:grid;grid-template-columns:1fr auto;align-items:center;gap:3px 10px;padding:10px 0;border-top:1px solid #eee9f4}.ocr-provider-count:first-of-type{border-top:0}.ocr-provider-count span{font-size:11px;color:var(--muted)}.ocr-provider-count strong{grid-row:1/3;grid-column:2;font-size:23px;color:var(--ink)}.ocr-provider-count em{font-size:10px;color:var(--muted);font-style:normal}
+    .usage-summary{display:flex;flex-wrap:wrap;gap:9px;margin:-3px 0 16px}.usage-card{min-width:230px;padding:11px 13px;border:1px solid var(--line);border-radius:14px;background:#faf8fd;color:var(--muted);font-size:12px}.usage-card strong{display:block;margin-bottom:3px;color:var(--ink);font-size:14px}.usage-count{font-size:20px;font-weight:850;color:var(--purple)}
     .log-list{display:grid;gap:11px}.log-row{padding:16px;border:1px solid var(--line);border-radius:18px;background:#fff}.log-main{display:grid;grid-template-columns:minmax(105px,.8fr) minmax(115px,.9fr) minmax(100px,.8fr) minmax(0,2.5fr);gap:13px;align-items:center}.log-cell small{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.log-cell strong{display:block;margin-top:2px;font-size:13px;overflow-wrap:anywhere}.status-pill{display:inline-flex!important;width:max-content;padding:5px 9px;border-radius:999px}.status-passed{color:#167b59;background:#e7f7f0}.status-silent{color:#756b85;background:#f1eef5}.status-fallback{color:#a86618;background:#fff2dc}.status-error{color:#ae3c57;background:#ffe8ee}.status-queued{color:#6652a2;background:#eee9ff}
     .log-facts{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}.fact{padding:5px 8px;border-radius:9px;background:#f8f5fb;color:#5f5770;font-size:11px}.fact.yes{color:#167b59;background:#eaf8f2}.fact.no{color:#ad4059;background:#fff0f3}.ocr-detail{margin-top:11px;color:var(--muted);font-size:12px}.ocr-detail summary{cursor:pointer;font-weight:700;color:#6e518e}.ocr-text{margin:8px 0 0;padding:11px;border-radius:11px;background:#f8f6fb;white-space:pre-wrap;overflow-wrap:anywhere}.empty-logs{text-align:center;padding:44px;color:var(--muted)}
-    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.log-toolbar{align-items:stretch;flex-direction:column}.log-actions{display:grid;grid-template-columns:1fr 1fr}.refresh-logs,.requeue-stuck{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}}
+    @media(max-width:960px){.ocr-usage-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid,.ocr-usage-grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.log-toolbar{align-items:stretch;flex-direction:column}.log-actions{display:grid;grid-template-columns:1fr 1fr}.refresh-logs,.requeue-stuck{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}.usage-card{min-width:100%}}
   </style>
 </head>
 <body>
@@ -843,6 +845,8 @@ export function dashboardHtml() { return `<!doctype html>
     </section>
     <div class="section-head"><div><h2>ตั้งค่าระบบแต่ละภูมิภาค</h2><p>กรอกเฉพาะค่าที่ต้องการเปลี่ยน ค่าเดิมจะไม่ถูกแสดงกลับมา</p></div><div class="secure-note">🔒 Secret เข้ารหัสแล้ว</div></div>
     <section class="grid" id="app"><div class="loading"><span class="spinner"></span><br>กำลังโหลดข้อมูล...</div></section>
+    <div class="section-head"><div><h2>การใช้งาน OCR วันนี้</h2><p>ตัวนับแยก OCR.space และ Workers AI ของแต่ละภูมิภาค</p></div><div class="secure-note">OCR.space ไม่เกิน 500 ครั้งต่อภาค/วัน</div></div>
+    <section class="ocr-usage-grid" id="ocr-usage-grid"><div class="loading"><span class="spinner"></span><br>กำลังโหลดตัวนับ...</div></section>
     <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">กดรีเฟรชเมื่อต้องการข้อมูลล่าสุด</div></div>
     <section class="log-panel">
       <div class="log-toolbar"><div class="log-tabs" id="log-tabs"></div><div class="log-actions"><button class="requeue-stuck" id="requeue-stuck">กู้รายการค้าง</button><button class="refresh-logs" id="refresh-logs">รีเฟรช Log</button></div></div>
@@ -858,6 +862,7 @@ export function dashboardHtml() { return `<!doctype html>
     const logList=document.querySelector('#log-list');
     const logTabs=document.querySelector('#log-tabs');
     const usageSummary=document.querySelector('#usage-summary');
+    const ocrUsageGrid=document.querySelector('#ocr-usage-grid');
     let activeLogRegion='north';
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
     function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
@@ -868,7 +873,22 @@ export function dashboardHtml() { return `<!doctype html>
     function providerName(provider){return provider==='ocrspace'?'OCR.space':provider==='workers_ai_vision'?'Workers AI Vision':provider==='ocrspace+workers_ai_vision'?'OCR.space → Workers AI Vision':provider||'รอระบุ'}
     function renderUsage(items){
       const byProvider=Object.fromEntries(items.map(item=>[item.provider,item]));
-      usageSummary.innerHTML=['ocrspace','workers_ai_vision'].map(provider=>{const item=byProvider[provider]||{requestCount:0,successCount:0,errorCount:0};return '<div class="usage-card"><strong>'+providerName(provider)+'</strong> วันนี้: '+escapeHtml(item.requestCount)+' ครั้ง · สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</div>'}).join('')
+      usageSummary.innerHTML=['ocrspace','workers_ai_vision'].map(provider=>{const item=byProvider[provider]||{requestCount:0,successCount:0,errorCount:0};const limit=provider==='ocrspace'?' / 500':'';return '<div class="usage-card"><strong>'+providerName(provider)+' · '+meta[activeLogRegion].name+'</strong><span class="usage-count">'+escapeHtml(item.requestCount)+limit+'</span> ครั้ง · สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</div>'}).join('')
+    }
+    function renderAllUsage(items){
+      const keyed=Object.fromEntries(items.map(item=>[item.region+':'+item.provider,item]));
+      ocrUsageGrid.innerHTML=regions.map(region=>{
+        const ocr=keyed[region+':ocrspace']||{requestCount:0,successCount:0,errorCount:0};
+        const ai=keyed[region+':workers_ai_vision']||{requestCount:0,successCount:0,errorCount:0};
+        const provider=(label,item,suffix='')=>'<div class="ocr-provider-count"><span>'+label+'</span><em>สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</em><strong>'+escapeHtml(item.requestCount)+suffix+'</strong></div>';
+        return '<article class="ocr-usage-region"><h3>'+meta[region].icon+' '+meta[region].name+'</h3>'+provider('OCR.space',ocr,'/500')+provider('Workers AI Vision',ai)+'</article>'
+      }).join('')
+    }
+    async function loadAllUsage(){
+      const response=await fetch('/admin/api/usage-summary');
+      if(response.status===401){location='/admin';return}
+      if(!response.ok)throw new Error('โหลดตัวนับ OCR ไม่สำเร็จ');
+      renderAllUsage(await response.json())
     }
     async function load(){
       const response=await fetch('/admin/api/config');
@@ -913,7 +933,7 @@ export function dashboardHtml() { return `<!doctype html>
     }
     logTabs.innerHTML=regions.map(region=>'<button class="log-tab '+(region===activeLogRegion?'active':'')+'" data-log-region="'+region+'">'+meta[region].name+'</button>').join('');
     logTabs.querySelectorAll('.log-tab').forEach(button=>button.addEventListener('click',async()=>{activeLogRegion=button.dataset.logRegion;logTabs.querySelectorAll('.log-tab').forEach(tab=>tab.classList.toggle('active',tab===button));try{await loadLogs()}catch{notify('โหลด Log ไม่สำเร็จ',true)}}));
-    document.querySelector('#refresh-logs').addEventListener('click',()=>loadLogs().catch(()=>notify('โหลด Log ไม่สำเร็จ',true)));
+    document.querySelector('#refresh-logs').addEventListener('click',()=>Promise.all([loadLogs(),loadAllUsage()]).catch(()=>notify('โหลด Log หรือตัวนับไม่สำเร็จ',true)));
     document.querySelector('#requeue-stuck').addEventListener('click',async(event)=>{
       const button=event.currentTarget;button.disabled=true;button.textContent='กำลังกู้รายการ...';
       try{
@@ -926,6 +946,7 @@ export function dashboardHtml() { return `<!doctype html>
       finally{button.disabled=false;button.textContent='กู้รายการค้าง'}
     });
     load().catch(()=>{app.innerHTML='<div class="loading">โหลดข้อมูลไม่สำเร็จ กรุณารีเฟรชหน้าอีกครั้ง</div>';notify('โหลดข้อมูลไม่สำเร็จ',true)});
+    loadAllUsage().catch(()=>{ocrUsageGrid.innerHTML='<div class="loading">โหลดตัวนับ OCR ไม่สำเร็จ</div>';notify('โหลดตัวนับ OCR ไม่สำเร็จ',true)});
     loadLogs().catch(()=>{logList.innerHTML='<div class="empty-logs">โหลด Log ไม่สำเร็จ กรุณารีเฟรชอีกครั้ง</div>';notify('โหลด Log ไม่สำเร็จ',true)});
   </script>
 </body>
@@ -984,6 +1005,17 @@ async function admin(request: Request, env: Env, url: URL) {
     const rows = await env.DB.prepare("SELECT provider,request_count,success_count,error_count FROM daily_usage WHERE usage_date=? AND region=? AND provider IN ('ocrspace','workers_ai_vision') ORDER BY provider")
       .bind(today(), region).all<DailyUsageRow>();
     return json(rows.results.map((row) => ({
+      provider: row.provider,
+      requestCount: row.request_count,
+      successCount: row.success_count,
+      errorCount: row.error_count
+    })));
+  }
+  if (url.pathname === "/admin/api/usage-summary" && request.method === "GET") {
+    const rows = await env.DB.prepare("SELECT region,provider,request_count,success_count,error_count FROM daily_usage WHERE usage_date=? AND provider IN ('ocrspace','workers_ai_vision') ORDER BY region,provider")
+      .bind(today()).all<DailyUsageRow>();
+    return json(rows.results.map((row) => ({
+      region: row.region,
       provider: row.provider,
       requestCount: row.request_count,
       successCount: row.success_count,

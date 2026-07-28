@@ -37,7 +37,12 @@ describe("control dashboard", () => {
     expect(html).toContain("/admin/api/requeue-stuck");
     expect(html).toContain("/admin/api/logs?region=");
     expect(html).toContain("/admin/api/usage?region=");
+    expect(html).toContain("/admin/api/usage-summary");
     expect(html).toContain('id="usage-summary"');
+    expect(html).toContain('id="ocr-usage-grid"');
+    expect(html).toContain("การใช้งาน OCR วันนี้");
+    expect(html).toContain("OCR.space ไม่เกิน 500 ครั้งต่อภาค/วัน");
+    expect(html).toContain("Workers AI Vision");
     expect(html).toContain("ตรวจด้วย:");
     expect(html).toContain("OCR.space → Workers AI Vision");
     expect(html).toContain("AI มั่นใจ:");
