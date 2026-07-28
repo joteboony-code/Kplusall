@@ -9,8 +9,8 @@ import {
 } from "../src/index";
 
 describe("operational safety limits", () => {
-  it("accepts at most 13 images for one TID", () => {
-    expect(MAX_IMAGES_PER_JOB).toBe(13);
+  it("accepts at most 20 images for one TID", () => {
+    expect(MAX_IMAGES_PER_JOB).toBe(20);
   });
 
   it("rejects an image only after the configured byte ceiling", () => {

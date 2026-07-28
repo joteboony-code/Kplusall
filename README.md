@@ -24,7 +24,7 @@ rule is a final safety net.
 ## Operational safety
 
 - LINE receives HTTP 200 only after D1 persistence and Queue submission succeed.
-- One TID accepts at most 13 images.
+- One TID accepts at most 20 images.
 - Images larger than 5 MiB are rejected before OCR and Workers AI.
 - OCR.space errors are retried once, for two attempts total.
 
