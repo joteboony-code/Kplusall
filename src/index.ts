@@ -86,6 +86,37 @@ function today() { return new Date().toISOString().slice(0, 10); }
 function isRegion(value: string): value is Region { return REGIONS.includes(value as Region); }
 function cookie(request: Request, key: string) { return request.headers.get("cookie")?.split(";").map((v) => v.trim()).find((v) => v.startsWith(`${key}=`))?.slice(key.length + 1); }
 
+function imageBase64(bytes: Uint8Array) {
+  const chunks: string[] = [];
+  const chunkSize = 0x6000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    let binary = "";
+    for (const byte of bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length))) {
+      binary += String.fromCharCode(byte);
+    }
+    chunks.push(btoa(binary));
+  }
+  return chunks.join("");
+}
+
+export function ocrSpaceRequestInit(imageBytes: ArrayBuffer, apiKey: string): RequestInit {
+  const bytes = new Uint8Array(imageBytes);
+  const form = new FormData();
+  form.set("base64Image", `data:${imageMime(bytes)};base64,${imageBase64(bytes)}`);
+  form.set("language", "eng");
+  form.set("isOverlayRequired", "false");
+  form.set("detectOrientation", "true");
+  form.set("scale", "true");
+  form.set("isTable", "true");
+  form.set("OCREngine", "2");
+  return {
+    method: "POST",
+    headers: { apikey: apiKey },
+    body: form,
+    signal: AbortSignal.timeout(30_000)
+  };
+}
+
 async function hmac(text: string, key: string) {
   const cryptoKey = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return b64(new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(text))));
@@ -620,16 +651,16 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
       httpMetadata: { contentType: content.headers.get("content-type") ?? "image/jpeg" }
     });
   }
-  const form = new FormData();
-  form.append("apikey", c.ocrKey); form.append("language", "eng"); form.append("isOverlayRequired", "false");
-  form.append("file", new Blob([imageBytes]), "slip.jpg");
   if (!(await reserveOcrSpaceUsage(env, data.region))) {
     await env.DB.prepare("UPDATE slip_jobs SET status='quota_exhausted',result='needs_fallback',ocr_provider='ocrspace',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(`OCR.space ของภูมิภาคนี้ครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน`, row.id).run();
     await audit(env, "ocr_quota_exhausted", row.job_number, data.region);
     return;
   }
-  const response = await fetch("https://api.ocr.space/parse/image", { method: "POST", body: form });
+  const response = await fetch(
+    "https://api.ocr.space/parse/image",
+    ocrSpaceRequestInit(imageBytes, c.ocrKey)
+  );
   const payload = await response.json<any>().catch(() => ({}));
   const text = (payload.ParsedResults ?? []).map((v: any) => v.ParsedText ?? "").join("\n");
   const succeeded = response.ok && !payload.IsErroredOnProcessing;

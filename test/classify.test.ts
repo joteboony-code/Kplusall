@@ -6,6 +6,7 @@ import {
   imageSetMetadata,
   lineScopeFromEvent,
   mergeOcrAndWorkersAi,
+  ocrSpaceRequestInit,
   shouldUseWorkersAi
 } from "../src/index";
 
@@ -128,6 +129,24 @@ VOID -THB 1.22`);
     });
 
     expect(mergeOcrAndWorkersAi(ocr, ai).result).toBe("needs_fallback");
+  });
+
+  it("uses the proven OCR.space settings from the original Kplus122 system", () => {
+    const init = ocrSpaceRequestInit(
+      Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]).buffer,
+      "test-key"
+    );
+    const form = init.body as FormData;
+
+    expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("apikey")).toBe("test-key");
+    expect(form.get("base64Image")).toBe("data:image/jpeg;base64,/9j/2Q==");
+    expect(form.get("language")).toBe("eng");
+    expect(form.get("isOverlayRequired")).toBe("false");
+    expect(form.get("detectOrientation")).toBe("true");
+    expect(form.get("scale")).toBe("true");
+    expect(form.get("isTable")).toBe("true");
+    expect(form.get("OCREngine")).toBe("2");
   });
 
   it("fails only when Workers AI confidently reads a different amount", () => {
