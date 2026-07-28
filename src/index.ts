@@ -76,6 +76,10 @@ const dec = new TextDecoder();
 const JOB_REFERENCE_MINUTES = 30;
 const PASS_CLAIM_MINUTES = 2;
 const OCRSPACE_DAILY_LIMIT = 500;
+export const MAX_IMAGES_PER_JOB = 13;
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_OCR_ATTEMPTS = 2;
+const R2_FALLBACK_RETENTION_MS = 24 * 60 * 60 * 1000;
 const WORKERS_AI_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
 const WORKERS_AI_PROVIDER = "workers_ai_vision";
 export const VISIBLE_TEXT_PROMPT = `Transcribe only text that is clearly visible in this image.
@@ -89,6 +93,9 @@ function unb64(text: string) { const s = atob(text); return Uint8Array.from(s, (
 function today() { return new Date().toISOString().slice(0, 10); }
 function isRegion(value: string): value is Region { return REGIONS.includes(value as Region); }
 function cookie(request: Request, key: string) { return request.headers.get("cookie")?.split(";").map((v) => v.trim()).find((v) => v.startsWith(`${key}=`))?.slice(key.length + 1); }
+export function shouldRetryOcr(attempt: number) { return attempt < MAX_OCR_ATTEMPTS; }
+export function imageTooLarge(size: number) { return !Number.isFinite(size) || size > MAX_IMAGE_BYTES; }
+export function imageExpired(uploaded: Date, now = Date.now()) { return now - uploaded.getTime() >= R2_FALLBACK_RETENTION_MS; }
 
 function imageBase64(bytes: Uint8Array) {
   const chunks: string[] = [];
@@ -288,12 +295,15 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
         id,region,parent_job_id,line_message_id,line_user_id,r2_key,
         line_reply_token,line_quote_token,webhook_event_id,
         image_set_id,image_set_index,image_set_total
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+      )
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?
+      WHERE (SELECT COUNT(*) FROM slip_jobs WHERE parent_job_id=?) < ?
       ON CONFLICT(region,line_message_id) DO NOTHING`)
       .bind(
         id, region, parent.id, messageId, userId, r2Key,
         event.replyToken, event.message.quoteToken ?? null, event.webhookEventId ?? null,
-        imageSet.id, imageSet.index, imageSet.total
+        imageSet.id, imageSet.index, imageSet.total,
+        parent.id, MAX_IMAGES_PER_JOB
       ).run();
     if ((inserted.meta.changes ?? 0) !== 1) {
       await env.DB.prepare(`UPDATE slip_jobs SET
@@ -308,7 +318,12 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
       if (duplicate?.status === "queued") {
         await env.OCR_JOBS.send({ id: duplicate.id, region });
       }
-      await audit(env, "image_duplicate_ignored", messageId, region);
+      await audit(
+        env,
+        duplicate ? "image_duplicate_ignored" : "image_limit_ignored",
+        duplicate ? messageId : `${parent.job_number}: เกิน ${MAX_IMAGES_PER_JOB} รูป`,
+        region
+      );
       continue;
     }
     await env.OCR_JOBS.send({ id, region });
@@ -326,7 +341,7 @@ async function recordWebhookFailure(env: Env, region: Region, error: unknown) {
   }
 }
 
-async function webhook(request: Request, env: Env, region: Region, ctx: ExecutionContext) {
+async function webhook(request: Request, env: Env, region: Region) {
   let c: RegionConfig;
   try { c = await config(env, region); } catch { return json({ error: "control secrets not initialized" }, 503); }
   if (!c.enabled || !c.lineSecret || !c.lineToken || !c.ocrKey) return json({ error: "region is not configured" }, 503);
@@ -335,9 +350,21 @@ async function webhook(request: Request, env: Env, region: Region, ctx: Executio
     await audit(env, "signature_invalid", "LINE signature rejected", region);
     return new Response("Unauthorized", { status: 401 });
   }
-  const payload = JSON.parse(raw) as { events?: LineEvent[] };
-  ctx.waitUntil(processWebhookEvents(payload.events ?? [], env, region).catch((error) => recordWebhookFailure(env, region, error)));
-  return new Response("OK");
+  let payload: { events?: LineEvent[] };
+  try {
+    payload = JSON.parse(raw) as { events?: LineEvent[] };
+  } catch {
+    return json({ error: "invalid LINE payload" }, 400);
+  }
+  try {
+    // Persist every event and enqueue every image before acknowledging LINE.
+    // A 503 lets LINE redeliver if D1 or Queues is temporarily unavailable.
+    await processWebhookEvents(payload.events ?? [], env, region);
+    return new Response("OK");
+  } catch (error) {
+    await recordWebhookFailure(env, region, error);
+    return json({ error: "webhook processing temporarily unavailable" }, 503);
+  }
 }
 
 function normalizeOcrText(text: string) {
@@ -632,25 +659,56 @@ async function deliverResult(env: Env, row: SlipProcessRow, token: string, resul
   }
 }
 
-async function processJob(env: Env, data: { id: string; region: Region }) {
+async function deleteCachedImage(env: Env, row: Pick<SlipProcessRow, "id" | "region" | "r2_key">) {
+  try {
+    await env.SLIPS.delete(row.r2_key);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error("failed to delete processed image", { id: row.id, region: row.region, error: detail });
+    try {
+      await audit(env, "r2_delete_error", `${row.id}: ${detail}`, row.region);
+    } catch (auditError) {
+      console.error("failed to audit R2 delete error", { id: row.id, region: row.region, error: auditError });
+    }
+  }
+}
+
+async function rejectOversizedImage(env: Env, row: SlipProcessRow, size: number) {
+  const reason = `รูปมีขนาด ${size} bytes เกินเพดาน ${MAX_IMAGE_BYTES} bytes`;
+  await env.DB.prepare("UPDATE slip_jobs SET status='image_too_large',result='needs_fallback',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    .bind(reason, row.id).run();
+  await audit(env, "image_too_large", `${row.job_number}: ${size} bytes`, row.region);
+  await deleteCachedImage(env, row);
+}
+
+async function processJob(env: Env, data: { id: string; region: Region }, attempt = 1) {
   const row = await env.DB.prepare("SELECT s.*,u.job_number,u.line_source_type,u.result_sent_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?")
     .bind(data.id, data.region).first<SlipProcessRow>();
   if (!row) return;
   const c = await config(env, data.region); if (!c.enabled || !c.ocrKey || !c.lineToken) throw new Error("region configuration unavailable");
   if ((row.status === "passed" || row.status === "failed") && !row.result_sent_at) {
+    await deleteCachedImage(env, row);
     await deliverResult(env, row, c.lineToken, row.status);
     return;
   }
-  if (row.status !== "queued") return;
+  if (row.status !== "queued") {
+    await deleteCachedImage(env, row);
+    return;
+  }
   if (row.result_sent_at) {
     await env.DB.prepare("UPDATE slip_jobs SET status='suppressed',result='silent',decision_reason='งานนี้แจ้งผลตรวจไปแล้ว จึงไม่ตรวจซ้ำ',updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(row.id).run();
     await audit(env, "ocr_suppressed_after_result", row.job_number, data.region);
+    await deleteCachedImage(env, row);
     return;
   }
   let imageBytes: ArrayBuffer;
   const object = await env.SLIPS.get(row.r2_key);
   if (object && "body" in object && object.body) {
+    if (imageTooLarge(object.size)) {
+      await rejectOversizedImage(env, row, object.size);
+      return;
+    }
     imageBytes = await new Response(object.body).arrayBuffer();
   } else {
     const content = await fetch(`https://api-data.line.me/v2/bot/message/${row.line_message_id}/content`, {
@@ -658,9 +716,23 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
     });
     if (!content.ok) {
       await audit(env, "line_image_download_failed", `${row.job_number}: HTTP ${content.status}`, data.region);
-      throw new Error(`LINE image download failed: HTTP ${content.status}`);
+      if (shouldRetryOcr(attempt)) throw new Error(`LINE image download failed: HTTP ${content.status}`);
+      await env.DB.prepare("UPDATE slip_jobs SET status='download_error',result='needs_fallback',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .bind(`โหลดรูปจาก LINE ไม่สำเร็จหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: HTTP ${content.status}`, row.id).run();
+      await deleteCachedImage(env, row);
+      return;
+    }
+    const declaredSize = Number(content.headers.get("content-length"));
+    if (content.headers.has("content-length") && imageTooLarge(declaredSize)) {
+      await content.body?.cancel();
+      await rejectOversizedImage(env, row, declaredSize);
+      return;
     }
     imageBytes = await content.arrayBuffer();
+    if (imageTooLarge(imageBytes.byteLength)) {
+      await rejectOversizedImage(env, row, imageBytes.byteLength);
+      return;
+    }
     await env.SLIPS.put(row.r2_key, imageBytes, {
       httpMetadata: { contentType: content.headers.get("content-type") ?? "image/jpeg" }
     });
@@ -669,21 +741,67 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
     await env.DB.prepare("UPDATE slip_jobs SET status='quota_exhausted',result='needs_fallback',ocr_provider='ocrspace',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(`OCR.space ของภูมิภาคนี้ครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน`, row.id).run();
     await audit(env, "ocr_quota_exhausted", row.job_number, data.region);
+    await deleteCachedImage(env, row);
     return;
   }
-  const response = await fetch(
-    "https://api.ocr.space/parse/image",
-    ocrSpaceRequestInit(imageBytes, c.ocrKey)
-  );
-  const payload = await response.json<any>().catch(() => ({}));
+  let response: Response;
+  try {
+    response = await fetch(
+      "https://api.ocr.space/parse/image",
+      ocrSpaceRequestInit(imageBytes, c.ocrKey)
+    );
+  } catch (error) {
+    const errorDetail = error instanceof Error ? error.message : String(error);
+    await recordOcrSpaceOutcome(env, data.region, false);
+    await audit(env, "ocr_error", errorDetail, data.region);
+    if (shouldRetryOcr(attempt)) {
+      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .bind(
+          errorDetail.slice(0, 10000),
+          `OCR.space ผิดพลาดครั้งที่ ${attempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
+          row.id
+        ).run();
+      throw new Error(`OCR.space retryable fetch error: ${errorDetail}`);
+    }
+    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(
+        errorDetail.slice(0, 10000),
+        `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
+        row.id
+      ).run();
+    await deleteCachedImage(env, row);
+    return;
+  }
+  let payload: any;
+  let payloadParsed = true;
+  try {
+    payload = await response.json<any>();
+  } catch {
+    payload = {};
+    payloadParsed = false;
+  }
   const text = (payload.ParsedResults ?? []).map((v: any) => v.ParsedText ?? "").join("\n");
-  const succeeded = response.ok && !payload.IsErroredOnProcessing;
+  const succeeded = response.ok && payloadParsed && !payload.IsErroredOnProcessing;
   await recordOcrSpaceOutcome(env, data.region, succeeded);
   if (!succeeded) {
-    const errorDetail = String(payload.ErrorMessage ?? response.status);
-    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-      .bind(errorDetail.slice(0, 10000), `OCR.space ผิดพลาด: ${errorDetail}`.slice(0, 1000), row.id).run();
+    const errorDetail = String(payload.ErrorMessage ?? (payloadParsed ? response.status : "invalid JSON response"));
     await audit(env, "ocr_error", errorDetail, data.region);
+    if (shouldRetryOcr(attempt)) {
+      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .bind(
+          errorDetail.slice(0, 10000),
+          `OCR.space ผิดพลาดครั้งที่ ${attempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
+          row.id
+        ).run();
+      throw new Error(`OCR.space retryable error: ${errorDetail}`);
+    }
+    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(
+        errorDetail.slice(0, 10000),
+        `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
+        row.id
+      ).run();
+    await deleteCachedImage(env, row);
     return;
   }
   const analysis = analyzeOcr(text);
@@ -755,6 +873,7 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
       aiAnalysis ? (aiAnalysis.confident ? 1 : 0) : null,
       row.id
     ).run();
+  await deleteCachedImage(env, row);
   if (finalAnalysis.result === "passed" || finalAnalysis.result === "failed") {
     row.matched_amount = finalAnalysis.matchedAmount;
     row.detected_amounts = JSON.stringify(finalAnalysis.detectedAmounts);
@@ -781,6 +900,21 @@ async function cleanupOldLogs(env: Env) {
     env.DB.prepare("DELETE FROM user_jobs WHERE updated_at < datetime('now','-30 days') AND NOT EXISTS (SELECT 1 FROM slip_jobs WHERE slip_jobs.parent_job_id=user_jobs.id)")
   ]);
   console.log(JSON.stringify({ event: "retention_cleanup", retentionDays: 30, changes: results.map((result) => result.meta.changes ?? 0) }));
+}
+
+async function cleanupExpiredImages(env: Env) {
+  let cursor: string | undefined;
+  let deleted = 0;
+  do {
+    const page = await env.SLIPS.list({ cursor, limit: 1000 });
+    const keys = page.objects.filter((object) => imageExpired(object.uploaded)).map((object) => object.key);
+    if (keys.length) {
+      await env.SLIPS.delete(keys);
+      deleted += keys.length;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  console.log(JSON.stringify({ event: "r2_daily_cleanup", retentionHours: 24, deleted }));
 }
 
 export function dashboardHtml() { return `<!doctype html>
@@ -881,7 +1015,7 @@ export function dashboardHtml() { return `<!doctype html>
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
     function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
     function formatTime(value){if(!value)return '—';const date=new Date(String(value).replace(' ','T')+'Z');return Number.isNaN(date.getTime())?value:date.toLocaleString('th-TH',{dateStyle:'short',timeStyle:'short'})}
-    function statusInfo(item){const key=item.status==='quota_exhausted'?'quota_exhausted':(item.result||item.status);return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],silent:['เงียบ','status-silent'],needs_fallback:['รอตรวจสำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
+    function statusInfo(item){const key=['quota_exhausted','image_too_large','download_error','ocr_error'].includes(item.status)?item.status:(item.result||item.status);return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],silent:['เงียบ','status-silent'],needs_fallback:['รอตรวจสำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],image_too_large:['รูปใหญ่เกินกำหนด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
     function fact(label,value){const state=value===null?'':(value?' yes':' no');const text=value===null?'—':(value?'พบ':'ไม่พบ');return '<span class="fact'+state+'">'+label+': '+text+'</span>'}
     function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
     function providerName(provider){return provider==='ocrspace'?'OCR.space':provider==='workers_ai_vision'?'Workers AI Vision':provider==='ocrspace+workers_ai_vision'?'OCR.space → Workers AI Vision':provider||'รอระบุ'}
@@ -1104,11 +1238,11 @@ async function admin(request: Request, env: Env, url: URL) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/webhook/")) { const region = url.pathname.split("/")[2]; if (!isRegion(region) || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region, ctx); }
+    if (url.pathname.startsWith("/webhook/")) { const region = url.pathname.split("/")[2]; if (!isRegion(region) || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region); }
     if (url.pathname.startsWith("/admin")) return admin(request, env, url);
     if (url.pathname === "/health") return json({ ok:true, service:"kplusall" });
     return new Response("Kplusall Worker", { status:200 });
   },
-  async queue(batch, env) { for (const message of batch.messages) { try { await processJob(env, message.body as { id:string; region:Region }); message.ack(); } catch (error) { await audit(env,"queue_error",error instanceof Error ? error.message : String(error)); message.retry(); } } },
-  async scheduled(_controller, env, ctx) { ctx.waitUntil(cleanupOldLogs(env)); }
+  async queue(batch, env) { for (const message of batch.messages) { try { await processJob(env, message.body as { id:string; region:Region }, message.attempts); message.ack(); } catch (error) { await audit(env,"queue_error",error instanceof Error ? error.message : String(error)); message.retry(); } } },
+  async scheduled(_controller, env, ctx) { ctx.waitUntil(Promise.all([cleanupOldLogs(env), cleanupExpiredImages(env)])); }
 } satisfies ExportedHandler<Env>;

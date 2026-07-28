@@ -20,6 +20,6 @@
   ],
   "queues": {
     "producers": [{ "binding": "OCR_JOBS", "queue": "kplusall-ocr-jobs" }],
-    "consumers": [{ "queue": "kplusall-ocr-jobs", "max_batch_size": 1, "max_retries": 3, "max_concurrency": 2 }]
+    "consumers": [{ "queue": "kplusall-ocr-jobs", "max_batch_size": 1, "max_retries": 1, "max_concurrency": 2 }]
   }
 }

@@ -17,6 +17,17 @@ Bucket `kplusall-slips` uses the lifecycle rule
 expires stored LINE images after 1 day. Cloudflare may take up to approximately
 24 additional hours to physically remove an expired object.
 
+Processed images are deleted from R2 immediately. The daily scheduled cleanup
+removes any temporary retry image older than 24 hours, and the bucket lifecycle
+rule is a final safety net.
+
+## Operational safety
+
+- LINE receives HTTP 200 only after D1 persistence and Queue submission succeed.
+- One TID accepts at most 13 images.
+- Images larger than 5 MiB are rejected before OCR and Workers AI.
+- OCR.space errors are retried once, for two attempts total.
+
 ตรวจสอบกฎที่ใช้งานจริง:
 
 ```bash
