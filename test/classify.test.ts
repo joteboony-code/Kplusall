@@ -5,6 +5,7 @@ import {
   classify,
   imageSetMetadata,
   lineScopeFromEvent,
+  mergeOcrAndWorkersAi,
   shouldUseWorkersAi
 } from "../src/index";
 
@@ -61,6 +62,72 @@ describe("original KPLUS settlement rules", () => {
       detectedAmounts: ["1.22", "-1.22"],
       confident: true
     });
+  });
+
+  it("parses labeled prose when the vision model ignores JSON Mode", () => {
+    expect(analyzeWorkersAiVision(`**Receipt Analysis**
+**FoundKplus:** False
+**FoundSettlement:** True
+**Amounts:**
+* 1.22 THB
+**Confident:** True`)).toMatchObject({
+      result: "needs_fallback",
+      foundKplus: false,
+      foundSettlement: true,
+      matchedAmount: "1.22",
+      detectedAmounts: ["1.22"],
+      confident: true
+    });
+  });
+
+  it("passes the real missed receipt by combining OCR.space and Workers AI evidence", () => {
+    const ocr = analyzeOcr(`SETTI-IAMF-NEI'
+CHANNEL: KPLUS
+AMT: THB 1.22
+VOID -THB 1.22`);
+    const ai = analyzeWorkersAiVision(`**Receipt Analysis**
+**FoundKplus:** False
+**FoundSettlement:** True
+**Amounts:**
+* 1.22 THB (clearly readable)
+**Confident:** True`);
+
+    expect(mergeOcrAndWorkersAi(ocr, ai)).toMatchObject({
+      result: "passed",
+      foundKplus: true,
+      foundSettlement: true,
+      matchedAmount: "1.22",
+      detectedAmounts: ["1.22", "-1.22"]
+    });
+  });
+
+  it("does not pass merged evidence when the confirmed amount is wrong", () => {
+    const ocr = analyzeOcr("CHANNEL: KPLUS AMT: THB 40.00");
+    const ai = analyzeWorkersAiVision({
+      foundKplus: false,
+      foundSettlement: true,
+      amounts: ["40.00", "-40.08"],
+      confident: true
+    });
+
+    expect(mergeOcrAndWorkersAi(ocr, ai)).toMatchObject({
+      result: "failed",
+      foundKplus: true,
+      foundSettlement: true,
+      matchedAmount: null
+    });
+  });
+
+  it("does not let uncertain AI evidence turn an OCR result into a pass", () => {
+    const ocr = analyzeOcr("CHANNEL: KPLUS AMT: THB 1.22");
+    const ai = analyzeWorkersAiVision({
+      foundKplus: false,
+      foundSettlement: true,
+      amounts: ["1.22"],
+      confident: false
+    });
+
+    expect(mergeOcrAndWorkersAi(ocr, ai).result).toBe("needs_fallback");
   });
 
   it("fails only when Workers AI confidently reads a different amount", () => {

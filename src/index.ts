@@ -374,6 +374,31 @@ function visionAmounts(values: unknown) {
   return [...new Set(amounts)].slice(0, 12).map((amount) => amount.toFixed(2));
 }
 
+function visionProseBoolean(text: string, field: "foundKplus" | "foundSettlement" | "confident") {
+  const cleaned = text.replace(/[*_`]/g, "");
+  const label = field === "foundKplus"
+    ? "found\\s*kplus"
+    : field === "foundSettlement"
+      ? "found\\s*settlement"
+      : "confident";
+  const match = cleaned.match(new RegExp(`\\b${label}\\b\\s*(?::|=|is)\\s*(true|false)\\b`, "i"));
+  if (!match) return undefined;
+  return match[1].toLowerCase() === "true";
+}
+
+function visionProseValue(rawText: string) {
+  const foundKplus = visionProseBoolean(rawText, "foundKplus");
+  const foundSettlement = visionProseBoolean(rawText, "foundSettlement");
+  const confident = visionProseBoolean(rawText, "confident");
+  if (foundKplus === undefined || foundSettlement === undefined || confident === undefined) return null;
+  return {
+    foundKplus,
+    foundSettlement,
+    confident,
+    amounts: receiptAmounts(rawText).map((amount) => amount.toFixed(2))
+  };
+}
+
 export function analyzeWorkersAiVision(response: unknown): WorkersAiVisionAnalysis {
   const rawText = typeof response === "string" ? response : JSON.stringify(response ?? "");
   let value: Record<string, unknown>;
@@ -385,16 +410,21 @@ export function analyzeWorkersAiVision(response: unknown): WorkersAiVisionAnalys
       value = JSON.parse(jsonText) as Record<string, unknown>;
     }
   } catch {
-    return {
-      result: "needs_fallback",
-      foundKplus: false,
-      foundSettlement: false,
-      matchedAmount: null,
-      detectedAmounts: [],
-      confident: false,
-      rawText,
-      reason: "Workers AI Vision ตอบกลับไม่เป็น JSON ที่ระบบอ่านได้"
-    };
+    const proseValue = visionProseValue(rawText);
+    if (proseValue) {
+      value = proseValue;
+    } else {
+      return {
+        result: "needs_fallback",
+        foundKplus: false,
+        foundSettlement: false,
+        matchedAmount: null,
+        detectedAmounts: [],
+        confident: false,
+        rawText,
+        reason: "Workers AI Vision ตอบกลับในรูปแบบที่ระบบอ่านไม่ได้"
+      };
+    }
   }
   const foundKplus = value.foundKplus === true;
   const foundSettlement = value.foundSettlement === true;
@@ -431,6 +461,56 @@ export function analyzeWorkersAiVision(response: unknown): WorkersAiVisionAnalys
   };
 }
 
+export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalysis): OcrAnalysis {
+  const aiCanConfirm = ai.confident;
+  const foundKplus = ocr.foundKplus || (aiCanConfirm && ai.foundKplus);
+  const foundSettlement = ocr.foundSettlement || (aiCanConfirm && ai.foundSettlement);
+  const detectedAmounts = [...new Set([
+    ...ocr.detectedAmounts,
+    ...(aiCanConfirm ? ai.detectedAmounts : [])
+  ])].slice(0, 12);
+  const matchedAmount = detectedAmounts.find((amount) => Math.abs(Math.abs(Number(amount)) - 1.22) < 0.005) ?? null;
+
+  if (!aiCanConfirm) {
+    return {
+      result: "needs_fallback",
+      foundKplus,
+      foundSettlement,
+      matchedAmount,
+      detectedAmounts,
+      reason: ai.reason
+    };
+  }
+  if (foundKplus && foundSettlement && matchedAmount) {
+    return {
+      result: "passed",
+      foundKplus,
+      foundSettlement,
+      matchedAmount,
+      detectedAmounts,
+      reason: `OCR.space และ Workers AI Vision ยืนยันร่วมกัน: พบ KPLUS, SETTLEMENT และยอด ${matchedAmount}`
+    };
+  }
+  if (foundKplus && foundSettlement && detectedAmounts.length > 0) {
+    return {
+      result: "failed",
+      foundKplus,
+      foundSettlement,
+      matchedAmount,
+      detectedAmounts,
+      reason: "OCR.space และ Workers AI Vision ยืนยันร่วมกัน: พบ KPLUS และ SETTLEMENT แต่ยอดไม่ใช่ 1.22 หรือ -1.22"
+    };
+  }
+  return {
+    result: "needs_fallback",
+    foundKplus,
+    foundSettlement,
+    matchedAmount,
+    detectedAmounts,
+    reason: "OCR.space และ Workers AI Vision ยังพบหลักฐานไม่ครบ จึงยังไม่แจ้งผล"
+  };
+}
+
 function imageMime(bytes: Uint8Array) {
   if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
   if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return "image/webp";
@@ -441,11 +521,14 @@ async function runWorkersAiVision(env: Env, imageBytes: ArrayBuffer) {
   const bytes = new Uint8Array(imageBytes);
   const image = `data:${imageMime(bytes)};base64,${b64(bytes)}`;
   const input = {
-    prompt: `Inspect this single receipt image independently. Do not guess.
+    prompt: `Return ONLY one compact JSON object with exactly these keys and no markdown or explanation:
+{"foundKplus":false,"foundSettlement":false,"amounts":[],"confident":false}
+Inspect this single receipt image independently. Do not guess.
 foundKplus is true only when KPLUS, K+, Thai QR Payment, or clear KBank/KPLUS receipt evidence is visible.
 foundSettlement is true only when the word SETTLEMENT is visibly readable.
 amounts must contain every clearly readable monetary amount with its minus sign and two decimals.
-confident is true only when the required words and amounts used for the decision are clearly readable.`,
+confident is true only when the required words and amounts used for the decision are clearly readable.
+Return ONLY the JSON object.`,
     image,
     max_tokens: 256,
     temperature: 0,
@@ -566,8 +649,8 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
     try {
       aiAnalysis = await runWorkersAiVision(env, imageBytes);
       await recordWorkersAiOutcome(env, data.region, true);
-      finalAnalysis = aiAnalysis;
-      await audit(env, `workers_ai_${aiAnalysis.result}`, row.job_number, data.region);
+      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
+      await audit(env, `workers_ai_${finalAnalysis.result}`, row.job_number, data.region);
     } catch (error) {
       await recordWorkersAiOutcome(env, data.region, false);
       const detail = error instanceof Error ? error.message : String(error);
@@ -581,7 +664,7 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
         rawText: detail,
         reason: `Workers AI Vision ผิดพลาด: ${detail}`.slice(0, 1000)
       };
-      finalAnalysis = aiAnalysis;
+      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
       await audit(env, "workers_ai_error", detail, data.region);
     }
   }
