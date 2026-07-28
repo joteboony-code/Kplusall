@@ -78,6 +78,10 @@ const PASS_CLAIM_MINUTES = 2;
 const OCRSPACE_DAILY_LIMIT = 500;
 const WORKERS_AI_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
 const WORKERS_AI_PROVIDER = "workers_ai_vision";
+export const VISIBLE_TEXT_PROMPT = `Transcribe only text that is clearly visible in this image.
+Preserve line breaks, decimal points, and minus signs exactly as printed.
+Do not describe the image, infer hidden text, correct values, or add commentary.
+If no text is readable, return NONE.`;
 
 function json(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } }); }
 function b64(bytes: Uint8Array) { let s = ""; bytes.forEach((b) => s += String.fromCharCode(b)); return btoa(s); }
@@ -492,6 +496,33 @@ export function analyzeWorkersAiVision(response: unknown): WorkersAiVisionAnalys
   };
 }
 
+export function analyzeWorkersAiTranscription(response: unknown): WorkersAiVisionAnalysis {
+  const rawText = typeof response === "string" ? response.trim() : "";
+  if (!rawText || rawText.toUpperCase() === "NONE") {
+    return {
+      result: "needs_fallback",
+      foundKplus: false,
+      foundSettlement: false,
+      matchedAmount: null,
+      detectedAmounts: [],
+      confident: false,
+      rawText,
+      reason: "Workers AI Vision ถอดข้อความที่อ่านได้ไม่สำเร็จ"
+    };
+  }
+  const analysis = analyzeOcr(rawText);
+  const confident = analysis.foundKplus || analysis.foundSettlement || analysis.detectedAmounts.length > 0;
+  return {
+    ...analysis,
+    result: analysis.result === "silent" ? "needs_fallback" : analysis.result,
+    confident,
+    rawText,
+    reason: confident
+      ? `Workers AI Vision ถอดข้อความแล้ว: ${analysis.reason}`
+      : "Workers AI Vision ถอดข้อความแล้วแต่ไม่พบหลักฐานที่ใช้ตัดสิน"
+  };
+}
+
 export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalysis): OcrAnalysis {
   const aiCanConfirm = ai.confident;
   const foundKplus = ocr.foundKplus || (aiCanConfirm && ai.foundKplus);
@@ -503,6 +534,12 @@ export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalys
   const matchedAmount = detectedAmounts.find((amount) => Math.abs(Math.abs(Number(amount)) - 1.22) < 0.005) ?? null;
 
   if (!aiCanConfirm) {
+    if (ocr.result === "failed") {
+      return {
+        ...ocr,
+        reason: `${ocr.reason}; Workers AI Vision อ่านเพิ่มไม่ได้ จึงคงผลไม่ผ่านจาก OCR.space`
+      };
+    }
     return {
       result: "needs_fallback",
       foundKplus,
@@ -550,37 +587,14 @@ function imageMime(bytes: Uint8Array) {
 
 async function runWorkersAiVision(env: Env, imageBytes: ArrayBuffer) {
   const bytes = new Uint8Array(imageBytes);
-  const image = `data:${imageMime(bytes)};base64,${b64(bytes)}`;
-  const input = {
-    prompt: `Return ONLY one compact JSON object with exactly these keys and no markdown or explanation:
-{"foundKplus":false,"foundSettlement":false,"amounts":[],"confident":false}
-Inspect this single receipt image independently. Do not guess.
-foundKplus is true only when KPLUS, K+, Thai QR Payment, or clear KBank/KPLUS receipt evidence is visible.
-foundSettlement is true only when the word SETTLEMENT is visibly readable.
-amounts must contain every clearly readable monetary amount with its minus sign and two decimals.
-confident is true only when the required words and amounts used for the decision are clearly readable.
-Return ONLY the JSON object.`,
-    image,
-    max_tokens: 256,
-    temperature: 0,
-    response_format: {
-      type: "json_schema",
-      json_schema: {
-        type: "object",
-        properties: {
-          foundKplus: { type: "boolean" },
-          foundSettlement: { type: "boolean" },
-          amounts: { type: "array", items: { type: "string" } },
-          confident: { type: "boolean" }
-        },
-        required: ["foundKplus", "foundSettlement", "amounts", "confident"],
-        additionalProperties: false
-      }
-    }
-  };
-  const output = await env.AI.run(WORKERS_AI_MODEL, input);
+  const output = await env.AI.run(WORKERS_AI_MODEL, {
+    prompt: VISIBLE_TEXT_PROMPT,
+    image: Array.from(bytes),
+    max_tokens: 500,
+    temperature: 0
+  });
   const response: unknown = output.response;
-  return analyzeWorkersAiVision(response);
+  return analyzeWorkersAiTranscription(response);
 }
 
 async function deliverResult(env: Env, row: SlipProcessRow, token: string, result: "passed" | "failed") {

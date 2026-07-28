@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   analyzeOcr,
+  analyzeWorkersAiTranscription,
   analyzeWorkersAiVision,
   classify,
   imageSetMetadata,
   lineScopeFromEvent,
   mergeOcrAndWorkersAi,
   ocrSpaceRequestInit,
-  shouldUseWorkersAi
+  shouldUseWorkersAi,
+  VISIBLE_TEXT_PROMPT
 } from "../src/index";
 
 describe("original KPLUS settlement rules", () => {
@@ -129,6 +131,34 @@ VOID -THB 1.22`);
     });
 
     expect(mergeOcrAndWorkersAi(ocr, ai).result).toBe("needs_fallback");
+  });
+
+  it("keeps a conclusive OCR.space failure when Workers AI cannot read more", () => {
+    const ocr = analyzeOcr("CHANNEL: KPLUS\nSETTLEMENT\nTOTAL THB 60.00\nVOID -THB 60.00");
+    const ai = analyzeWorkersAiTranscription("NONE");
+
+    expect(mergeOcrAndWorkersAi(ocr, ai)).toMatchObject({
+      result: "failed",
+      foundKplus: true,
+      foundSettlement: true,
+      matchedAmount: null,
+      detectedAmounts: ["60.00", "-60.00"]
+    });
+  });
+
+  it("uses the original Kplus122 transcription-only Workers AI rule", () => {
+    expect(VISIBLE_TEXT_PROMPT).not.toContain("KPLUS");
+    expect(VISIBLE_TEXT_PROMPT).not.toContain("SETTLEMENT");
+    expect(VISIBLE_TEXT_PROMPT).not.toContain("1.22");
+    expect(analyzeWorkersAiTranscription(
+      "CHANNEL: KPLUS\nSETTLEMENT\nAMT: THB -1.22"
+    )).toMatchObject({
+      result: "passed",
+      foundKplus: true,
+      foundSettlement: true,
+      matchedAmount: "-1.22",
+      confident: true
+    });
   });
 
   it("uses the proven OCR.space settings from the original Kplus122 system", () => {
