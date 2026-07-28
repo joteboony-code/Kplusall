@@ -40,6 +40,8 @@ describe("LINE inspection delivery", () => {
         }
       }]
     });
+    expect(payload.messages[0].text).toContain("✅ ตรวจสอบผ่าน: พบสลิป KPLUS\nยอด 1.22 บาท ข้อมูลถูกต้อง");
+    expect(payload.messages[0].text).not.toContain("เลขงาน");
   });
 
   it("returns a failed result through Reply API", async () => {
@@ -65,6 +67,13 @@ describe("LINE inspection delivery", () => {
     }, "failed");
 
     const payload = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(payload.messages[0].text).toBe(
+      "❌ ตรวจสอบไม่ผ่าน: สลิป KPLUS\n" +
+      "ยอดที่อ่านได้: 9.99 บาท\n" +
+      "สาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\n" +
+      "หาก Test ผ่าน Link POS อย่าลืมลง Remark"
+    );
+    expect(payload.messages[0].text).not.toContain("เลขงาน");
     expect(payload.messages[0].text).toContain("ตรวจสอบไม่ผ่าน");
     expect(payload.messages[0].text).toContain("9.99");
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain("/push");

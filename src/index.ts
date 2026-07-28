@@ -134,9 +134,10 @@ async function lineCall(token: string, endpoint: string, body: unknown) {
 
 function inspectionResultMessage(row: SlipProcessRow, result: "passed" | "failed") {
   const detectedAmounts = decodeAmounts(row.detected_amounts);
+  const detectedAmountText = detectedAmounts.length ? `${detectedAmounts.join(", ")} บาท` : "อ่านยอดไม่ได้";
   const resultText = result === "passed"
-    ? `✅ ตรวจสอบผ่าน: พบสลิป KPLUS ยอด ${row.matched_amount ?? "1.22"} บาท\nเลขงาน ${row.job_number}`
-    : `❌ ตรวจสอบไม่ผ่าน: สลิป KPLUS\nยอดที่อ่านได้: ${detectedAmounts.length ? `${detectedAmounts.join(", ")} บาท` : "อ่านยอดไม่ได้"}\nเลขงาน ${row.job_number}`;
+    ? `✅ ตรวจสอบผ่าน: พบสลิป KPLUS\nยอด ${row.matched_amount ?? "1.22"} บาท ข้อมูลถูกต้อง`
+    : `❌ ตรวจสอบไม่ผ่าน: สลิป KPLUS\nยอดที่อ่านได้: ${detectedAmountText}\nสาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\nหาก Test ผ่าน Link POS อย่าลืมลง Remark`;
   const quote = row.line_quote_token ? { quoteToken: row.line_quote_token } : {};
   if ((row.line_source_type === "group" || row.line_source_type === "room") && row.line_user_id) {
     return {
