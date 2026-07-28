@@ -1,6 +1,6 @@
 type Region = "north" | "central" | "isan" | "south" | "bangkok";
 type Env = {
-  DB: D1Database; SLIPS: R2Bucket; OCR_JOBS: Queue;
+  DB: D1Database; SLIPS: R2Bucket; OCR_JOBS: Queue; AI: Ai;
   ADMIN_PASSWORD?: string; CONFIG_ENCRYPTION_KEY?: string;
 };
 type RegionConfigRow = { region: Region; enabled: number; line_channel_secret: ArrayBuffer | null; line_channel_token: ArrayBuffer | null; ocrspace_api_key: ArrayBuffer | null };
@@ -27,12 +27,22 @@ type OcrLogRow = {
   detected_amounts: string | null;
   decision_reason: string | null;
   ocr_excerpt: string | null;
+  ocrspace_found_kplus: number | null;
+  ocrspace_found_settlement: number | null;
+  ocrspace_detected_amounts: string | null;
+  ai_provider: string | null;
+  ai_response_excerpt: string | null;
+  ai_found_kplus: number | null;
+  ai_found_settlement: number | null;
+  ai_detected_amounts: string | null;
+  ai_confident: number | null;
   image_set_id: string | null;
   image_set_index: number | null;
   image_set_total: number | null;
   created_at: string;
   updated_at: string;
 };
+type DailyUsageRow = { provider: string; request_count: number; success_count: number; error_count: number };
 type LineImageSet = { id?: string; index?: number; total?: number };
 type LineEvent = {
   type?: string;
@@ -66,6 +76,8 @@ const dec = new TextDecoder();
 const JOB_REFERENCE_MINUTES = 30;
 const PASS_CLAIM_MINUTES = 2;
 const OCRSPACE_DAILY_LIMIT = 500;
+const WORKERS_AI_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
+const WORKERS_AI_PROVIDER = "workers_ai_vision";
 
 function json(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } }); }
 function b64(bytes: Uint8Array) { let s = ""; bytes.forEach((b) => s += String.fromCharCode(b)); return btoa(s); }
@@ -125,6 +137,19 @@ async function recordOcrSpaceOutcome(env: Env, region: Region, success: boolean)
       error_count=error_count+?
     WHERE usage_date=? AND region=? AND provider='ocrspace'`)
     .bind(success ? 1 : 0, success ? 0 : 1, today(), region).run();
+}
+async function beginWorkersAiUsage(env: Env, region: Region) {
+  await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,?)")
+    .bind(today(), region, WORKERS_AI_PROVIDER).run();
+  await env.DB.prepare("UPDATE daily_usage SET request_count=request_count+1 WHERE usage_date=? AND region=? AND provider=?")
+    .bind(today(), region, WORKERS_AI_PROVIDER).run();
+}
+async function recordWorkersAiOutcome(env: Env, region: Region, success: boolean) {
+  await env.DB.prepare(`UPDATE daily_usage SET
+      success_count=success_count+?,
+      error_count=error_count+?
+    WHERE usage_date=? AND region=? AND provider=?`)
+    .bind(success ? 1 : 0, success ? 0 : 1, today(), region, WORKERS_AI_PROVIDER).run();
 }
 async function lineCall(token: string, endpoint: string, body: unknown) {
   const headers: Record<string, string> = { authorization: `Bearer ${token}`, "content-type": "application/json" };
@@ -332,6 +357,99 @@ export function analyzeOcr(text: string): OcrAnalysis {
 }
 export function classify(text: string) { return analyzeOcr(text).result; }
 
+export function shouldUseWorkersAi(analysis: OcrAnalysis) {
+  return analysis.result !== "passed" && (analysis.foundKplus || analysis.foundSettlement);
+}
+
+type WorkersAiVisionAnalysis = OcrAnalysis & { confident: boolean; rawText: string };
+
+function visionAmounts(values: unknown) {
+  if (!Array.isArray(values)) return [];
+  const amounts = values.flatMap((value) => {
+    const match = String(value).replace(/[‐‑‒–—−]/g, "-").match(/-?\d+(?:[.,]\d{1,2})?/);
+    if (!match) return [];
+    const amount = Number(match[0].replace(",", "."));
+    return Number.isFinite(amount) ? [amount] : [];
+  });
+  return [...new Set(amounts)].slice(0, 12).map((amount) => amount.toFixed(2));
+}
+
+export function analyzeWorkersAiVision(rawText: string): WorkersAiVisionAnalysis {
+  const jsonText = rawText.match(/\{[\s\S]*\}/)?.[0] ?? "";
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(jsonText) as Record<string, unknown>;
+  } catch {
+    return {
+      result: "needs_fallback",
+      foundKplus: false,
+      foundSettlement: false,
+      matchedAmount: null,
+      detectedAmounts: [],
+      confident: false,
+      rawText,
+      reason: "Workers AI Vision ตอบกลับไม่เป็น JSON ที่ระบบอ่านได้"
+    };
+  }
+  const foundKplus = value.foundKplus === true;
+  const foundSettlement = value.foundSettlement === true;
+  const confident = value.confident === true;
+  const detectedAmounts = visionAmounts(value.amounts);
+  const matchedAmount = detectedAmounts.find((amount) => Math.abs(Math.abs(Number(amount)) - 1.22) < 0.005) ?? null;
+  if (!confident) {
+    return {
+      result: "needs_fallback", foundKplus, foundSettlement, matchedAmount, detectedAmounts, confident, rawText,
+      reason: "Workers AI Vision ไม่มั่นใจ จึงยังไม่แจ้งผล"
+    };
+  }
+  if (!foundKplus || !foundSettlement) {
+    return {
+      result: "needs_fallback", foundKplus, foundSettlement, matchedAmount, detectedAmounts, confident, rawText,
+      reason: "Workers AI Vision พบหลักฐาน KPLUS หรือ SETTLEMENT ไม่ครบ จึงยังไม่แจ้งผล"
+    };
+  }
+  if (matchedAmount) {
+    return {
+      result: "passed", foundKplus, foundSettlement, matchedAmount, detectedAmounts, confident, rawText,
+      reason: `Workers AI Vision ยืนยัน KPLUS, SETTLEMENT และยอด ${matchedAmount}`
+    };
+  }
+  if (detectedAmounts.length > 0) {
+    return {
+      result: "failed", foundKplus, foundSettlement, matchedAmount, detectedAmounts, confident, rawText,
+      reason: "Workers AI Vision ยืนยัน KPLUS และ SETTLEMENT แต่ยอดไม่ใช่ 1.22 หรือ -1.22"
+    };
+  }
+  return {
+    result: "needs_fallback", foundKplus, foundSettlement, matchedAmount, detectedAmounts, confident, rawText,
+    reason: "Workers AI Vision พบ KPLUS และ SETTLEMENT แต่ยังอ่านยอดไม่ชัด"
+  };
+}
+
+function imageMime(bytes: Uint8Array) {
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return "image/webp";
+  return "image/jpeg";
+}
+
+async function runWorkersAiVision(env: Env, imageBytes: ArrayBuffer) {
+  const bytes = new Uint8Array(imageBytes);
+  const image = `data:${imageMime(bytes)};base64,${b64(bytes)}`;
+  const output = await env.AI.run(WORKERS_AI_MODEL, {
+    prompt: `Inspect this single receipt image independently. Do not guess.
+Return only one JSON object with exactly these fields:
+{"foundKplus":boolean,"foundSettlement":boolean,"amounts":["string"],"confident":boolean}
+foundKplus is true only when KPLUS, K+, Thai QR Payment, or clear KBank/KPLUS receipt evidence is visible.
+foundSettlement is true only when the word SETTLEMENT is visibly readable.
+amounts must contain every clearly readable monetary amount with its minus sign and two decimals.
+confident is true only when the required words and amounts used for the decision are clearly readable.`,
+    image,
+    max_tokens: 180,
+    temperature: 0
+  });
+  return analyzeWorkersAiVision(output.response ?? "");
+}
+
 async function deliverResult(env: Env, row: SlipProcessRow, token: string, result: "passed" | "failed") {
   if (row.result_sent_at) return;
   const claimToken = crypto.randomUUID();
@@ -422,13 +540,79 @@ async function processJob(env: Env, data: { id: string; region: Region }) {
     return;
   }
   const analysis = analyzeOcr(text);
-  await env.DB.prepare("UPDATE slip_jobs SET status=?,ocr_provider='ocrspace',ocr_text=?,result=?,found_kplus=?,found_settlement=?,matched_amount=?,detected_amounts=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-    .bind(analysis.result, text.slice(0, 10000), analysis.result, analysis.foundKplus ? 1 : 0, analysis.foundSettlement ? 1 : 0, analysis.matchedAmount, JSON.stringify(analysis.detectedAmounts), analysis.reason, row.id).run();
-  if (analysis.result === "passed" || analysis.result === "failed") {
-    row.matched_amount = analysis.matchedAmount;
-    row.detected_amounts = JSON.stringify(analysis.detectedAmounts);
-    row.decision_reason = analysis.reason;
-    await deliverResult(env, row, c.lineToken, analysis.result);
+  let finalAnalysis = analysis;
+  let aiAnalysis: WorkersAiVisionAnalysis | null = null;
+  if (shouldUseWorkersAi(analysis)) {
+    await beginWorkersAiUsage(env, data.region);
+    try {
+      aiAnalysis = await runWorkersAiVision(env, imageBytes);
+      await recordWorkersAiOutcome(env, data.region, true);
+      finalAnalysis = aiAnalysis;
+      await audit(env, `workers_ai_${aiAnalysis.result}`, row.job_number, data.region);
+    } catch (error) {
+      await recordWorkersAiOutcome(env, data.region, false);
+      const detail = error instanceof Error ? error.message : String(error);
+      aiAnalysis = {
+        result: "needs_fallback",
+        foundKplus: false,
+        foundSettlement: false,
+        matchedAmount: null,
+        detectedAmounts: [],
+        confident: false,
+        rawText: detail,
+        reason: `Workers AI Vision ผิดพลาด: ${detail}`.slice(0, 1000)
+      };
+      finalAnalysis = aiAnalysis;
+      await audit(env, "workers_ai_error", detail, data.region);
+    }
+  }
+  await env.DB.prepare(`UPDATE slip_jobs SET
+      status=?,
+      ocr_provider=?,
+      ocr_text=?,
+      result=?,
+      found_kplus=?,
+      found_settlement=?,
+      matched_amount=?,
+      detected_amounts=?,
+      decision_reason=?,
+      ocrspace_found_kplus=?,
+      ocrspace_found_settlement=?,
+      ocrspace_detected_amounts=?,
+      ai_provider=?,
+      ai_response=?,
+      ai_found_kplus=?,
+      ai_found_settlement=?,
+      ai_detected_amounts=?,
+      ai_confident=?,
+      updated_at=CURRENT_TIMESTAMP
+    WHERE id=?`)
+    .bind(
+      finalAnalysis.result,
+      aiAnalysis ? "ocrspace+workers_ai_vision" : "ocrspace",
+      text.slice(0, 10000),
+      finalAnalysis.result,
+      finalAnalysis.foundKplus ? 1 : 0,
+      finalAnalysis.foundSettlement ? 1 : 0,
+      finalAnalysis.matchedAmount,
+      JSON.stringify(finalAnalysis.detectedAmounts),
+      finalAnalysis.reason,
+      analysis.foundKplus ? 1 : 0,
+      analysis.foundSettlement ? 1 : 0,
+      JSON.stringify(analysis.detectedAmounts),
+      aiAnalysis ? WORKERS_AI_PROVIDER : null,
+      aiAnalysis?.rawText.slice(0, 10000) ?? null,
+      aiAnalysis ? (aiAnalysis.foundKplus ? 1 : 0) : null,
+      aiAnalysis ? (aiAnalysis.foundSettlement ? 1 : 0) : null,
+      aiAnalysis ? JSON.stringify(aiAnalysis.detectedAmounts) : null,
+      aiAnalysis ? (aiAnalysis.confident ? 1 : 0) : null,
+      row.id
+    ).run();
+  if (finalAnalysis.result === "passed" || finalAnalysis.result === "failed") {
+    row.matched_amount = finalAnalysis.matchedAmount;
+    row.detected_amounts = JSON.stringify(finalAnalysis.detectedAmounts);
+    row.decision_reason = finalAnalysis.reason;
+    await deliverResult(env, row, c.lineToken, finalAnalysis.result);
   }
   await audit(env, `ocr_${analysis.result}`, row.job_number, data.region);
 }
@@ -508,6 +692,7 @@ export function dashboardHtml() { return `<!doctype html>
     .toast{position:fixed;right:22px;bottom:22px;z-index:20;padding:13px 17px;border-radius:14px;color:white;background:#342d48;box-shadow:0 14px 34px rgba(45,39,65,.25);opacity:0;transform:translateY(15px);pointer-events:none;transition:.25s}.toast.show{opacity:1;transform:none}.toast.error{background:#b94561}
     .log-panel{padding:20px;border:1px solid rgba(255,255,255,.92);border-radius:25px;background:rgba(255,255,255,.82);box-shadow:0 16px 40px rgba(73,55,108,.09);backdrop-filter:blur(14px)}
     .log-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.log-tabs,.log-actions{display:flex;flex-wrap:wrap;gap:8px}.log-tab,.refresh-logs,.requeue-stuck{padding:9px 13px;border:1px solid var(--line);border-radius:999px;background:white;color:var(--ink);font-weight:750;cursor:pointer}.log-tab.active{border-color:transparent;color:white;background:linear-gradient(100deg,var(--pink),var(--purple));box-shadow:0 7px 18px rgba(139,92,246,.2)}.refresh-logs,.requeue-stuck{border-radius:12px}.requeue-stuck{color:#7852bb;background:#f6f1ff}
+    .usage-summary{display:flex;flex-wrap:wrap;gap:9px;margin:-3px 0 16px}.usage-card{padding:8px 11px;border:1px solid var(--line);border-radius:12px;background:#faf8fd;color:var(--muted);font-size:12px}.usage-card strong{color:var(--ink)}
     .log-list{display:grid;gap:11px}.log-row{padding:16px;border:1px solid var(--line);border-radius:18px;background:#fff}.log-main{display:grid;grid-template-columns:minmax(105px,.8fr) minmax(115px,.9fr) minmax(100px,.8fr) minmax(0,2.5fr);gap:13px;align-items:center}.log-cell small{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.log-cell strong{display:block;margin-top:2px;font-size:13px;overflow-wrap:anywhere}.status-pill{display:inline-flex!important;width:max-content;padding:5px 9px;border-radius:999px}.status-passed{color:#167b59;background:#e7f7f0}.status-silent{color:#756b85;background:#f1eef5}.status-fallback{color:#a86618;background:#fff2dc}.status-error{color:#ae3c57;background:#ffe8ee}.status-queued{color:#6652a2;background:#eee9ff}
     .log-facts{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}.fact{padding:5px 8px;border-radius:9px;background:#f8f5fb;color:#5f5770;font-size:11px}.fact.yes{color:#167b59;background:#eaf8f2}.fact.no{color:#ad4059;background:#fff0f3}.ocr-detail{margin-top:11px;color:var(--muted);font-size:12px}.ocr-detail summary{cursor:pointer;font-weight:700;color:#6e518e}.ocr-text{margin:8px 0 0;padding:11px;border-radius:11px;background:#f8f6fb;white-space:pre-wrap;overflow-wrap:anywhere}.empty-logs{text-align:center;padding:44px;color:var(--muted)}
     @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.log-toolbar{align-items:stretch;flex-direction:column}.log-actions{display:grid;grid-template-columns:1fr 1fr}.refresh-logs,.requeue-stuck{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}}
@@ -516,7 +701,7 @@ export function dashboardHtml() { return `<!doctype html>
 <body>
   <main class="shell">
     <section class="hero">
-      <div class="brand"><div class="brand-icon">✦</div><div><h1>Kplusall <span class="gradient-text">Control</span></h1><p class="subtitle">ศูนย์จัดการ LINE OA และ OCR.space สำหรับทั้ง 5 ภูมิภาค</p></div></div>
+      <div class="brand"><div class="brand-icon">✦</div><div><h1>Kplusall <span class="gradient-text">Control</span></h1><p class="subtitle">ศูนย์จัดการ LINE OA, OCR.space และ Workers AI สำหรับทั้ง 5 ภูมิภาค</p></div></div>
       <div class="summary">
         <div class="summary-item"><span class="summary-value">5</span><span class="summary-label">ภูมิภาคทั้งหมด</span></div>
         <div class="summary-item"><span class="summary-value" id="active-count">—</span><span class="summary-label">กำลังเปิดใช้งาน</span></div>
@@ -528,6 +713,7 @@ export function dashboardHtml() { return `<!doctype html>
     <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">🔄 อัปเดตทุก 30 วินาที</div></div>
     <section class="log-panel">
       <div class="log-toolbar"><div class="log-tabs" id="log-tabs"></div><div class="log-actions"><button class="requeue-stuck" id="requeue-stuck">กู้รายการค้าง</button><button class="refresh-logs" id="refresh-logs">รีเฟรช Log</button></div></div>
+      <div class="usage-summary" id="usage-summary"></div>
       <div class="log-list" id="log-list"><div class="empty-logs"><span class="spinner"></span><br>กำลังโหลด Log...</div></div>
     </section>
   </main>
@@ -538,13 +724,19 @@ export function dashboardHtml() { return `<!doctype html>
     const app=document.querySelector('#app');
     const logList=document.querySelector('#log-list');
     const logTabs=document.querySelector('#log-tabs');
+    const usageSummary=document.querySelector('#usage-summary');
     let activeLogRegion='north';
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
     function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
     function formatTime(value){if(!value)return '—';const date=new Date(String(value).replace(' ','T')+'Z');return Number.isNaN(date.getTime())?value:date.toLocaleString('th-TH',{dateStyle:'short',timeStyle:'short'})}
-    function statusInfo(item){const key=item.status==='quota_exhausted'?'quota_exhausted':(item.result||item.status);return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],silent:['เงียบ','status-silent'],needs_fallback:['รอ OCR สำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
+    function statusInfo(item){const key=item.status==='quota_exhausted'?'quota_exhausted':(item.result||item.status);return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],silent:['เงียบ','status-silent'],needs_fallback:['รอตรวจสำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
     function fact(label,value){const state=value===null?'':(value?' yes':' no');const text=value===null?'—':(value?'พบ':'ไม่พบ');return '<span class="fact'+state+'">'+label+': '+text+'</span>'}
     function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
+    function providerName(provider){return provider==='ocrspace'?'OCR.space':provider==='workers_ai_vision'?'Workers AI Vision':provider==='ocrspace+workers_ai_vision'?'OCR.space → Workers AI Vision':provider||'รอระบุ'}
+    function renderUsage(items){
+      const byProvider=Object.fromEntries(items.map(item=>[item.provider,item]));
+      usageSummary.innerHTML=['ocrspace','workers_ai_vision'].map(provider=>{const item=byProvider[provider]||{requestCount:0,successCount:0,errorCount:0};return '<div class="usage-card"><strong>'+providerName(provider)+'</strong> วันนี้: '+escapeHtml(item.requestCount)+' ครั้ง · สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</div>'}).join('')
+    }
     async function load(){
       const response=await fetch('/admin/api/config');
       if(!response.ok){location='/admin';return}
@@ -570,17 +762,21 @@ export function dashboardHtml() { return `<!doctype html>
       if(!items.length){logList.innerHTML='<div class="empty-logs">ยังไม่มีประวัติการตรวจของ '+meta[activeLogRegion].name+'</div>';return}
       logList.innerHTML=items.map(item=>{
         const status=statusInfo(item);const amounts=item.matchedAmount||((item.detectedAmounts||[]).join(', '))||'ไม่พบ';
-        const detail=item.ocrExcerpt?'<details class="ocr-detail"><summary>ดูข้อความ OCR บางส่วน</summary><pre class="ocr-text">'+escapeHtml(item.ocrExcerpt)+'</pre></details>':'';
+        const ocrDetail=item.ocrExcerpt?'<details class="ocr-detail"><summary>ดูข้อความ OCR.space บางส่วน</summary><pre class="ocr-text">'+escapeHtml(item.ocrExcerpt)+'</pre></details>':'';
+        const aiDetail=item.aiResponseExcerpt?'<details class="ocr-detail"><summary>ดูคำตอบ Workers AI Vision</summary><pre class="ocr-text">'+escapeHtml(item.aiResponseExcerpt)+'</pre></details>':'';
         const imageSet=item.imageSetTotal?'<span class="fact">รูปในชุด: '+escapeHtml((item.imageSetIndex??'?')+'/'+item.imageSetTotal)+'</span>':'';
-        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(item.provider==='ocrspace'?'OCR.space':(item.provider||'รอระบุ'))+'</span>'+imageSet+fact('KPLUS/K+',item.foundKplus)+fact('SETTLEMENT',item.foundSettlement)+'<span class="fact">ยอดที่พบ: '+escapeHtml(amounts)+'</span></div>'+detail+'</article>'
+        const ocrAmounts=(item.ocrspaceDetectedAmounts||[]).join(', ')||'ไม่พบ';
+        const aiFacts=item.aiProvider?fact('AI KPLUS/K+',item.aiFoundKplus)+fact('AI SETTLEMENT',item.aiFoundSettlement)+'<span class="fact">AI ยอด: '+escapeHtml((item.aiDetectedAmounts||[]).join(', ')||'ไม่พบ')+'</span><span class="fact">AI มั่นใจ: '+(item.aiConfident?'ใช่':'ไม่')+'</span>':'';
+        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(providerName(item.provider))+'</span>'+imageSet+fact('OCR KPLUS/K+',item.ocrspaceFoundKplus)+fact('OCR SETTLEMENT',item.ocrspaceFoundSettlement)+'<span class="fact">OCR ยอด: '+escapeHtml(ocrAmounts)+'</span>'+aiFacts+'<span class="fact">ผลสุดท้าย ยอด: '+escapeHtml(amounts)+'</span></div>'+ocrDetail+aiDetail+'</article>'
       }).join('')
     }
     async function loadLogs(){
       logList.innerHTML='<div class="empty-logs"><span class="spinner"></span><br>กำลังโหลด Log...</div>';
-      const response=await fetch('/admin/api/logs?region='+encodeURIComponent(activeLogRegion));
+      const [response,usageResponse]=await Promise.all([fetch('/admin/api/logs?region='+encodeURIComponent(activeLogRegion)),fetch('/admin/api/usage?region='+encodeURIComponent(activeLogRegion))]);
       if(response.status===401){location='/admin';return}
-      if(!response.ok)throw new Error('โหลด Log ไม่สำเร็จ');
-      renderLogs(await response.json())
+      if(!response.ok||!usageResponse.ok)throw new Error('โหลด Log ไม่สำเร็จ');
+      renderLogs(await response.json());
+      renderUsage(await usageResponse.json())
     }
     logTabs.innerHTML=regions.map(region=>'<button class="log-tab '+(region===activeLogRegion?'active':'')+'" data-log-region="'+region+'">'+meta[region].name+'</button>').join('');
     logTabs.querySelectorAll('.log-tab').forEach(button=>button.addEventListener('click',async()=>{activeLogRegion=button.dataset.logRegion;logTabs.querySelectorAll('.log-tab').forEach(tab=>tab.classList.toggle('active',tab===button));try{await loadLogs()}catch{notify('โหลด Log ไม่สำเร็จ',true)}}));
@@ -650,10 +846,34 @@ async function admin(request: Request, env: Env, url: URL) {
       return json({ error: "requeue failed" }, 500);
     }
   }
+  if (url.pathname === "/admin/api/usage" && request.method === "GET") {
+    const region = url.searchParams.get("region") ?? "north";
+    if (!isRegion(region)) return json({ error:"invalid region" }, 400);
+    const rows = await env.DB.prepare("SELECT provider,request_count,success_count,error_count FROM daily_usage WHERE usage_date=? AND region=? AND provider IN ('ocrspace','workers_ai_vision') ORDER BY provider")
+      .bind(today(), region).all<DailyUsageRow>();
+    return json(rows.results.map((row) => ({
+      provider: row.provider,
+      requestCount: row.request_count,
+      successCount: row.success_count,
+      errorCount: row.error_count
+    })));
+  }
   if (url.pathname === "/admin/api/logs" && request.method === "GET") {
     const region = url.searchParams.get("region") ?? "north";
     if (!isRegion(region)) return json({ error:"invalid region" }, 400);
-    const rows = await env.DB.prepare("SELECT s.id,s.region,u.job_number,s.status,s.ocr_provider,s.result,s.found_kplus,s.found_settlement,s.matched_amount,s.detected_amounts,s.decision_reason,substr(s.ocr_text,1,500) AS ocr_excerpt,s.image_set_id,s.image_set_index,s.image_set_total,s.created_at,s.updated_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.region=? ORDER BY s.created_at DESC LIMIT 50")
+    const rows = await env.DB.prepare(`SELECT
+        s.id,s.region,u.job_number,s.status,s.ocr_provider,s.result,
+        s.found_kplus,s.found_settlement,s.matched_amount,s.detected_amounts,s.decision_reason,
+        substr(s.ocr_text,1,500) AS ocr_excerpt,
+        s.ocrspace_found_kplus,s.ocrspace_found_settlement,s.ocrspace_detected_amounts,
+        s.ai_provider,substr(s.ai_response,1,500) AS ai_response_excerpt,
+        s.ai_found_kplus,s.ai_found_settlement,s.ai_detected_amounts,s.ai_confident,
+        s.image_set_id,s.image_set_index,s.image_set_total,s.created_at,s.updated_at
+      FROM slip_jobs s
+      JOIN user_jobs u ON u.id=s.parent_job_id
+      WHERE s.region=?
+      ORDER BY s.created_at DESC
+      LIMIT 50`)
       .bind(region).all<OcrLogRow>();
     return json(rows.results.map((row) => ({
       id: row.id,
@@ -668,6 +888,15 @@ async function admin(request: Request, env: Env, url: URL) {
       detectedAmounts: decodeAmounts(row.detected_amounts),
       reason: row.decision_reason,
       ocrExcerpt: row.ocr_excerpt,
+      ocrspaceFoundKplus: row.ocrspace_found_kplus === null ? (row.ai_provider ? null : row.found_kplus === null ? null : Boolean(row.found_kplus)) : Boolean(row.ocrspace_found_kplus),
+      ocrspaceFoundSettlement: row.ocrspace_found_settlement === null ? (row.ai_provider ? null : row.found_settlement === null ? null : Boolean(row.found_settlement)) : Boolean(row.ocrspace_found_settlement),
+      ocrspaceDetectedAmounts: decodeAmounts(row.ocrspace_detected_amounts ?? (row.ai_provider ? null : row.detected_amounts)),
+      aiProvider: row.ai_provider,
+      aiResponseExcerpt: row.ai_response_excerpt,
+      aiFoundKplus: row.ai_found_kplus === null ? null : Boolean(row.ai_found_kplus),
+      aiFoundSettlement: row.ai_found_settlement === null ? null : Boolean(row.ai_found_settlement),
+      aiDetectedAmounts: decodeAmounts(row.ai_detected_amounts),
+      aiConfident: row.ai_confident === null ? null : Boolean(row.ai_confident),
       imageSetId: row.image_set_id,
       imageSetIndex: row.image_set_index,
       imageSetTotal: row.image_set_total,

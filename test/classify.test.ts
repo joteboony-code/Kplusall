@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { analyzeOcr, classify, imageSetMetadata, lineScopeFromEvent } from "../src/index";
+import {
+  analyzeOcr,
+  analyzeWorkersAiVision,
+  classify,
+  imageSetMetadata,
+  lineScopeFromEvent,
+  shouldUseWorkersAi
+} from "../src/index";
 
 describe("original KPLUS settlement rules", () => {
   it("passes when both markers and 1.22 are present", () => {
@@ -22,6 +29,37 @@ describe("original KPLUS settlement rules", () => {
 
   it("holds for a later fallback when the amount is unreadable", () => {
     expect(classify("KPLUS SETTLEMENT amount unreadable")).toBe("needs_fallback");
+  });
+
+  it("uses Workers AI only for unresolved images with receipt evidence", () => {
+    expect(shouldUseWorkersAi(analyzeOcr("random equipment photo"))).toBe(false);
+    expect(shouldUseWorkersAi(analyzeOcr("KPLUS amount unreadable"))).toBe(true);
+    expect(shouldUseWorkersAi(analyzeOcr("SETTLEMENT amount unreadable"))).toBe(true);
+    expect(shouldUseWorkersAi(analyzeOcr("KPLUS SETTLEMENT 9.99"))).toBe(true);
+    expect(shouldUseWorkersAi(analyzeOcr("KPLUS SETTLEMENT 1.22"))).toBe(false);
+  });
+
+  it("accepts a confident Workers AI confirmation of the target amount", () => {
+    expect(analyzeWorkersAiVision('```json\n{"foundKplus":true,"foundSettlement":true,"amounts":["-1.22"],"confident":true}\n```')).toMatchObject({
+      result: "passed",
+      foundKplus: true,
+      foundSettlement: true,
+      matchedAmount: "-1.22",
+      confident: true
+    });
+  });
+
+  it("fails only when Workers AI confidently reads a different amount", () => {
+    expect(analyzeWorkersAiVision('{"foundKplus":true,"foundSettlement":true,"amounts":["40.00","-40.08"],"confident":true}')).toMatchObject({
+      result: "failed",
+      detectedAmounts: ["40.00", "-40.08"],
+      confident: true
+    });
+  });
+
+  it("keeps uncertain or malformed Workers AI output silent", () => {
+    expect(analyzeWorkersAiVision('{"foundKplus":true,"foundSettlement":true,"amounts":["1.22"],"confident":false}').result).toBe("needs_fallback");
+    expect(analyzeWorkersAiVision("I cannot read this image").result).toBe("needs_fallback");
   });
 
   it("returns the details needed by the regional control log", () => {

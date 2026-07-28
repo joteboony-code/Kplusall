@@ -8,6 +8,7 @@ Cloudflare Worker เดียวสำหรับ LINE OA 5 ภูมิภา
 - D1: `kplusall-db` (APAC)
 - R2: `kplusall-slips` (รูปสลิปเป็น private bucket)
 - Queue: `kplusall-ocr-jobs`
+- Workers AI Vision: `@cf/meta/llama-3.2-11b-vision-instruct`
 
 ## R2 retention
 
@@ -27,11 +28,11 @@ npx wrangler r2 bucket lifecycle list kplusall-slips
 1. รับเลขงาน 8 หลัก แยกตาม `region + ห้อง LINE + LINE user ID + Tid` และเก็บเลขงานล่าสุดไว้ 30 นาที.
 2. รับรูปทุกใบที่ส่งต่อจากเลขงานเดียวกัน รวมถึงชุดรูปที่มี `message.imageSet`.
 3. รูปแต่ละใบถูกส่งเข้าคิว แล้ว Worker ดาวน์โหลดจาก LINE และบันทึก private ใน R2 ก่อนตรวจ.
-4. ใช้ OCR.space ของ region นั้นเท่านั้น.
+4. ใช้ OCR.space ของ region นั้นเป็นด่านแรก.
    ระบบจองโควตาใน D1 ก่อนเรียก OCR และหยุดอัตโนมัติที่ 500 รูปต่อภูมิภาคต่อวัน.
 5. หลักฐาน `KPLUS`, `K+`, `THAIQR`, `Thai QR Payment` หรือ `QR PAYMENT` พร้อม `SETTLEMENT` และยอด `1.22` หรือ `-1.22` => `passed`.
-6. ขาดหลักฐาน KPLUS/K+ หรือ `SETTLEMENT` => `silent` (ไม่ตอบ).
-7. มี KPLUS/K+ และ `SETTLEMENT` พร้อมยอดอื่นที่อ่านได้ => `failed` และตอบผลไม่ผ่านด้วย Reply API; หากอ่านยอดไม่ได้ => `needs_fallback` (บันทึก Log แต่ยังไม่เรียก provider อื่น).
+6. หาก OCR.space ตัดสินไม่ได้แต่พบ KPLUS/K+ หรือ `SETTLEMENT` อย่างน้อยหนึ่งอย่าง ระบบส่งรูปนั้นให้ Workers AI Vision ตรวจซ้ำ; รูปที่ไม่มีหลักฐานทั้งสองอย่างไม่ใช้ AI.
+7. Workers AI Vision ต้องตอบว่ามั่นใจและพบ KPLUS/K+ พร้อม `SETTLEMENT` จึงตัดสินผล: ยอด `1.22`/`-1.22` => `passed`, ยอดอื่น => `failed`; ผลไม่มั่นใจหรือข้อมูลไม่ครบ => `needs_fallback` และไม่ตอบ LINE.
 8. ระหว่างรับเลขงานและรับรูป ระบบไม่ส่งข้อความตอบรับ.
 9. ระบบส่งผลผ่านหรือไม่ผ่านด้วย LINE Reply API เท่านั้น และใช้ D1 claim เพื่อไม่ตอบซ้ำแม้หลายรูปจบพร้อมกัน.
 10. รูปที่เริ่มประมวลผลหลังงานแจ้งผลแล้วจะหยุดตรวจเพื่อประหยัดโควตา แต่ยังมีรายการใน Log.
@@ -39,7 +40,8 @@ npx wrangler r2 bucket lifecycle list kplusall-slips
 ## Log ในหน้า Control
 
 - เลือกดูแยก 5 ภูมิภาค และแสดง 50 รายการล่าสุด.
-- แสดงเวลา เลขงาน ลำดับรูปในชุด ผลการตรวจ ผู้ให้บริการ OCR คำที่พบ ยอดที่พบ เหตุผล และข้อความ OCR บางส่วน.
+- แสดงเวลา เลขงาน ลำดับรูปในชุด ผลการตรวจ ผลแยกของ OCR.space/Workers AI Vision ยอดที่พบ ความมั่นใจ เหตุผล และคำตอบบางส่วน.
+- แสดงจำนวนครั้งที่เรียก OCR.space และ Workers AI Vision ของวันปัจจุบัน แยกตามภูมิภาค.
 - หน้าเว็บรีเฟรช Log อัตโนมัติทุก 30 วินาที.
 - เก็บ Log และข้อมูลงานย้อนหลัง 30 วัน แล้วลบอัตโนมัติทุกวันเวลา 01:17 น. ตามเวลาไทย.
 - หน้า Log ใช้สิทธิ์ Admin เดียวกับหน้าตั้งค่า และไม่แสดง LINE User ID หรือ Secret.

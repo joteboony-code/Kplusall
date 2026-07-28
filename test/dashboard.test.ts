@@ -20,7 +20,7 @@ describe("control dashboard", () => {
   it("renders the five-region summary and responsive themed controls", () => {
     const html = dashboardHtml();
 
-    expect(html).toContain("ศูนย์จัดการ LINE OA และ OCR.space");
+    expect(html).toContain("ศูนย์จัดการ LINE OA, OCR.space และ Workers AI");
     expect(html).toContain('id="active-count"');
     expect(html).toContain("ภาคเหนือ");
     expect(html).toContain("กรุงเทพฯ");
@@ -36,8 +36,12 @@ describe("control dashboard", () => {
     expect(html).toContain('id="requeue-stuck"');
     expect(html).toContain("/admin/api/requeue-stuck");
     expect(html).toContain("/admin/api/logs?region=");
+    expect(html).toContain("/admin/api/usage?region=");
+    expect(html).toContain('id="usage-summary"');
     expect(html).toContain("ตรวจด้วย:");
-    expect(html).toContain("ยอดที่พบ:");
+    expect(html).toContain("OCR.space → Workers AI Vision");
+    expect(html).toContain("AI มั่นใจ:");
+    expect(html).toContain("ผลสุดท้าย ยอด:");
     expect(html).toContain("รูปในชุด:");
     expect(html).toContain("KPLUS/K+");
     expect(html).toContain("setInterval");
