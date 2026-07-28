@@ -44,7 +44,8 @@ describe("control dashboard", () => {
     expect(html).toContain("ผลสุดท้าย ยอด:");
     expect(html).toContain("รูปในชุด:");
     expect(html).toContain("KPLUS/K+");
-    expect(html).toContain("setInterval");
+    expect(html).toContain("กดรีเฟรชเมื่อต้องการข้อมูลล่าสุด");
+    expect(html).not.toContain("setInterval");
   });
 
   it("uses the matching themed login page", () => {

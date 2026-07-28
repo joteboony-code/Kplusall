@@ -374,11 +374,16 @@ function visionAmounts(values: unknown) {
   return [...new Set(amounts)].slice(0, 12).map((amount) => amount.toFixed(2));
 }
 
-export function analyzeWorkersAiVision(rawText: string): WorkersAiVisionAnalysis {
-  const jsonText = rawText.match(/\{[\s\S]*\}/)?.[0] ?? "";
+export function analyzeWorkersAiVision(response: unknown): WorkersAiVisionAnalysis {
+  const rawText = typeof response === "string" ? response : JSON.stringify(response ?? "");
   let value: Record<string, unknown>;
   try {
-    value = JSON.parse(jsonText) as Record<string, unknown>;
+    if (response && typeof response === "object" && !Array.isArray(response)) {
+      value = response as Record<string, unknown>;
+    } else {
+      const jsonText = rawText.match(/\{[\s\S]*\}/)?.[0] ?? "";
+      value = JSON.parse(jsonText) as Record<string, unknown>;
+    }
   } catch {
     return {
       result: "needs_fallback",
@@ -435,19 +440,33 @@ function imageMime(bytes: Uint8Array) {
 async function runWorkersAiVision(env: Env, imageBytes: ArrayBuffer) {
   const bytes = new Uint8Array(imageBytes);
   const image = `data:${imageMime(bytes)};base64,${b64(bytes)}`;
-  const output = await env.AI.run(WORKERS_AI_MODEL, {
+  const input = {
     prompt: `Inspect this single receipt image independently. Do not guess.
-Return only one JSON object with exactly these fields:
-{"foundKplus":boolean,"foundSettlement":boolean,"amounts":["string"],"confident":boolean}
 foundKplus is true only when KPLUS, K+, Thai QR Payment, or clear KBank/KPLUS receipt evidence is visible.
 foundSettlement is true only when the word SETTLEMENT is visibly readable.
 amounts must contain every clearly readable monetary amount with its minus sign and two decimals.
 confident is true only when the required words and amounts used for the decision are clearly readable.`,
     image,
-    max_tokens: 180,
-    temperature: 0
-  });
-  return analyzeWorkersAiVision(output.response ?? "");
+    max_tokens: 256,
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        type: "object",
+        properties: {
+          foundKplus: { type: "boolean" },
+          foundSettlement: { type: "boolean" },
+          amounts: { type: "array", items: { type: "string" } },
+          confident: { type: "boolean" }
+        },
+        required: ["foundKplus", "foundSettlement", "amounts", "confident"],
+        additionalProperties: false
+      }
+    }
+  };
+  const output = await env.AI.run(WORKERS_AI_MODEL, input);
+  const response: unknown = output.response;
+  return analyzeWorkersAiVision(response);
 }
 
 async function deliverResult(env: Env, row: SlipProcessRow, token: string, result: "passed" | "failed") {
@@ -710,7 +729,7 @@ export function dashboardHtml() { return `<!doctype html>
     </section>
     <div class="section-head"><div><h2>ตั้งค่าระบบแต่ละภูมิภาค</h2><p>กรอกเฉพาะค่าที่ต้องการเปลี่ยน ค่าเดิมจะไม่ถูกแสดงกลับมา</p></div><div class="secure-note">🔒 Secret เข้ารหัสแล้ว</div></div>
     <section class="grid" id="app"><div class="loading"><span class="spinner"></span><br>กำลังโหลดข้อมูล...</div></section>
-    <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">🔄 อัปเดตทุก 30 วินาที</div></div>
+    <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">กดรีเฟรชเมื่อต้องการข้อมูลล่าสุด</div></div>
     <section class="log-panel">
       <div class="log-toolbar"><div class="log-tabs" id="log-tabs"></div><div class="log-actions"><button class="requeue-stuck" id="requeue-stuck">กู้รายการค้าง</button><button class="refresh-logs" id="refresh-logs">รีเฟรช Log</button></div></div>
       <div class="usage-summary" id="usage-summary"></div>
@@ -794,7 +813,6 @@ export function dashboardHtml() { return `<!doctype html>
     });
     load().catch(()=>{app.innerHTML='<div class="loading">โหลดข้อมูลไม่สำเร็จ กรุณารีเฟรชหน้าอีกครั้ง</div>';notify('โหลดข้อมูลไม่สำเร็จ',true)});
     loadLogs().catch(()=>{logList.innerHTML='<div class="empty-logs">โหลด Log ไม่สำเร็จ กรุณารีเฟรชอีกครั้ง</div>';notify('โหลด Log ไม่สำเร็จ',true)});
-    setInterval(()=>loadLogs().catch(()=>{}),30000);
   </script>
 </body>
 </html>`; }

@@ -49,6 +49,20 @@ describe("original KPLUS settlement rules", () => {
     });
   });
 
+  it("accepts the JSON object returned by Workers AI JSON Mode", () => {
+    expect(analyzeWorkersAiVision({
+      foundKplus: true,
+      foundSettlement: true,
+      amounts: ["1.22", "-1.22"],
+      confident: true
+    })).toMatchObject({
+      result: "passed",
+      matchedAmount: "1.22",
+      detectedAmounts: ["1.22", "-1.22"],
+      confident: true
+    });
+  });
+
   it("fails only when Workers AI confidently reads a different amount", () => {
     expect(analyzeWorkersAiVision('{"foundKplus":true,"foundSettlement":true,"amounts":["40.00","-40.08"],"confident":true}')).toMatchObject({
       result: "failed",
