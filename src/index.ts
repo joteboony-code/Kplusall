@@ -80,7 +80,11 @@ type SlipProcessRow = {
   decision_reason: string | null;
   result_sent_at: string | null;
 };
-const REGIONS: Region[] = ["north", "central", "isan", "south", "bangkok"];
+const REGIONS: Region[] = ["north", "isan", "south", "central", "bangkok"];
+const WEBHOOK_REGION_ALIASES: Record<string, Region> = {
+  phitsanulok: "central",
+  korat: "bangkok"
+};
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const JOB_REFERENCE_MINUTES = 30;
@@ -113,6 +117,9 @@ export function bangkokDate(now = new Date()) {
 }
 function today() { return bangkokDate(); }
 function isRegion(value: string): value is Region { return REGIONS.includes(value as Region); }
+export function regionFromWebhookPath(value: string): Region | null {
+  return WEBHOOK_REGION_ALIASES[value] ?? (isRegion(value) ? value : null);
+}
 function cookie(request: Request, key: string) { return request.headers.get("cookie")?.split(";").map((v) => v.trim()).find((v) => v.startsWith(`${key}=`))?.slice(key.length + 1); }
 export function shouldRetryOcr(attempt: number) { return attempt < MAX_OCR_ATTEMPTS; }
 export function imageTooLarge(size: number) { return !Number.isFinite(size) || size > MAX_IMAGE_BYTES; }
@@ -1193,8 +1200,8 @@ export function dashboardHtml() { return `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
   <script>
-    const regions=['north','central','isan','south','bangkok'];
-    const meta={north:{name:'ภาคเหนือ',icon:'⛰️'},central:{name:'ภาคกลาง',icon:'🌾'},isan:{name:'ภาคอีสาน',icon:'☀️'},south:{name:'ภาคใต้',icon:'🌊'},bangkok:{name:'กรุงเทพฯ',icon:'🏙️'}};
+    const regions=['north','isan','south','central','bangkok'];
+    const meta={north:{name:'ภาคเหนือ',code:'NORTH',icon:'⛰️'},isan:{name:'ภาคอีสาน',code:'ISAN',icon:'☀️'},south:{name:'ภาคใต้',code:'SOUTH',icon:'🌊'},central:{name:'พิษณุโลก',code:'PHITSANULOK',icon:'🌾'},bangkok:{name:'โคราช',code:'KORAT',icon:'🏙️'}};
     const app=document.querySelector('#app');
     const logList=document.querySelector('#log-list');
     const logTabs=document.querySelector('#log-tabs');
@@ -1238,7 +1245,7 @@ export function dashboardHtml() { return `<!doctype html>
       app.innerHTML=regions.map(region=>{
         const item=data.find(value=>value.region===region)||{enabled:false};
         const complete=Boolean(item.hasLineSecret&&item.hasLineToken&&item.hasOcrKey);
-        return '<article class="region-card"><div class="card-head"><div class="region-title"><div class="region-icon">'+meta[region].icon+'</div><div><div class="region-name">'+meta[region].name+'</div><div class="region-code">'+region+'</div></div></div><span class="badge '+(complete?'ready':'incomplete')+'">'+(complete?'พร้อมใช้งาน':'ตั้งค่าไม่ครบ')+'</span></div><div class="toggle-row"><div class="toggle-label"><strong>เปิดใช้งานภูมิภาคนี้</strong><span>รับ Webhook และประมวลผล OCR</span></div><label class="switch"><input type="checkbox" id="e-'+region+'" '+(item.enabled?'checked':'')+'><span class="slider"></span></label></div>'+field(region,'s','LINE Channel Secret','ใส่เมื่อสร้างหรือเปลี่ยน Secret',item.hasLineSecret)+field(region,'t','LINE Channel Access Token','ใส่เมื่อสร้างหรือเปลี่ยน Token',item.hasLineToken)+field(region,'o','OCR.space API Key','ใส่ API Key ของภูมิภาคนี้',item.hasOcrKey)+'<button class="save-region" data-region="'+region+'">บันทึก '+meta[region].name+'</button></article>'
+        return '<article class="region-card"><div class="card-head"><div class="region-title"><div class="region-icon">'+meta[region].icon+'</div><div><div class="region-name">'+meta[region].name+'</div><div class="region-code">'+meta[region].code+'</div></div></div><span class="badge '+(complete?'ready':'incomplete')+'">'+(complete?'พร้อมใช้งาน':'ตั้งค่าไม่ครบ')+'</span></div><div class="toggle-row"><div class="toggle-label"><strong>เปิดใช้งานภูมิภาคนี้</strong><span>รับ Webhook และประมวลผล OCR</span></div><label class="switch"><input type="checkbox" id="e-'+region+'" '+(item.enabled?'checked':'')+'><span class="slider"></span></label></div>'+field(region,'s','LINE Channel Secret','ใส่เมื่อสร้างหรือเปลี่ยน Secret',item.hasLineSecret)+field(region,'t','LINE Channel Access Token','ใส่เมื่อสร้างหรือเปลี่ยน Token',item.hasLineToken)+field(region,'o','OCR.space API Key','ใส่ API Key ของภูมิภาคนี้',item.hasOcrKey)+'<button class="save-region" data-region="'+region+'">บันทึก '+meta[region].name+'</button></article>'
       }).join('');
       document.querySelectorAll('.save-region').forEach(button=>button.addEventListener('click',()=>save(button.dataset.region,button)));
     }
@@ -1435,7 +1442,7 @@ async function admin(request: Request, env: Env, url: URL) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/webhook/")) { const region = url.pathname.split("/")[2]; if (!isRegion(region) || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region); }
+    if (url.pathname.startsWith("/webhook/")) { const region = regionFromWebhookPath(url.pathname.split("/")[2]); if (!region || request.method !== "POST") return new Response("Not Found", { status:404 }); return webhook(request, env, region); }
     if (url.pathname.startsWith("/admin")) return admin(request, env, url);
     if (url.pathname === "/health") return json({ ok:true, service:"kplusall" });
     return new Response("Kplusall Worker", { status:200 });

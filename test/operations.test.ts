@@ -6,6 +6,7 @@ import {
   MAX_IMAGE_BYTES,
   MAX_OCR_ATTEMPTS,
   rankOcrSpaceKeyRegions,
+  regionFromWebhookPath,
   shouldRetryOcr
 } from "../src/index";
 
@@ -32,6 +33,13 @@ describe("operational safety limits", () => {
   it("resets daily usage at midnight in Bangkok", () => {
     expect(bangkokDate(new Date("2026-07-28T16:59:59.000Z"))).toBe("2026-07-28");
     expect(bangkokDate(new Date("2026-07-28T17:00:00.000Z"))).toBe("2026-07-29");
+  });
+
+  it("maps the new public webhook paths onto the preserved database regions", () => {
+    expect(regionFromWebhookPath("phitsanulok")).toBe("central");
+    expect(regionFromWebhookPath("korat")).toBe("bangkok");
+    expect(regionFromWebhookPath("north")).toBe("north");
+    expect(regionFromWebhookPath("unknown")).toBeNull();
   });
 
   it("uses the region's own OCR.space key while it has capacity", () => {

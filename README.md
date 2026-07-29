@@ -1,6 +1,6 @@
 # Kplusall
 
-Cloudflare Worker เดียวสำหรับ LINE OA 5 ภูมิภาค: `north`, `central`, `isan`, `south`, `bangkok`.
+Cloudflare Worker เดียวสำหรับ LINE OA 5 พื้นที่: `north`, `isan`, `south`, `phitsanulok`, `korat`.
 
 ## ทรัพยากรที่สร้างแล้ว
 
@@ -87,10 +87,14 @@ Webhook URL:
 
 ```text
 /webhook/north
-/webhook/central
 /webhook/isan
 /webhook/south
-/webhook/bangkok
+/webhook/phitsanulok
+/webhook/korat
 ```
+
+ข้อมูลเดิมของ `central` ถูกใช้ต่อภายในสำหรับพิษณุโลก และข้อมูลเดิมของ `bangkok`
+ถูกใช้ต่อภายในสำหรับโคราช เพื่อรักษา Secret, ประวัติ และตัวนับเดิมโดยไม่ย้ายข้อมูลเสี่ยงสูญหาย
+เส้นทาง `/webhook/central` และ `/webhook/bangkok` ยังรองรับชั่วคราวระหว่างเปลี่ยนการตั้งค่า LINE OA
 
 ระบบไม่ตอบรับตอนรับเลขงานหรือรูป และใช้ Reply API เท่านั้นสำหรับผลตรวจผ่านหรือไม่ผ่านหลัง Queue ประมวลผลเสร็จ.

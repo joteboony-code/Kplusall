@@ -23,7 +23,10 @@ describe("control dashboard", () => {
     expect(html).toContain("ศูนย์จัดการ LINE OA, OCR.space และ Workers AI");
     expect(html).toContain('id="active-count"');
     expect(html).toContain("ภาคเหนือ");
-    expect(html).toContain("กรุงเทพฯ");
+    expect(html).toContain("พิษณุโลก");
+    expect(html).toContain("โคราช");
+    expect(html).not.toContain("ภาคกลาง");
+    expect(html).not.toContain("กรุงเทพฯ");
     expect(html).toContain("@media(max-width:760px)");
   });
 
