@@ -27,6 +27,12 @@ rule is a final safety net.
 - One TID has no application-level image-count limit.
 - Images larger than 8 MiB are rejected before OCR and Workers AI.
 - OCR.space errors are retried once, for two attempts total.
+- Result delivery uses the newest unused LINE Reply Token from the same
+  region, conversation, sender, and TID. Token age is stored with the result,
+  and the audit log records a warning at 50 seconds.
+- Integration tests run in the Cloudflare Workers runtime with real local D1
+  migrations, including latest-token selection, one-reply delivery, TID
+  isolation, and atomic reservation of OCR request number 500.
 
 ตรวจสอบกฎที่ใช้งานจริง:
 

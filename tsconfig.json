@@ -5,7 +5,10 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "lib": ["ES2022", "WebWorker"],
-    "types": ["@cloudflare/workers-types"],
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-pool-workers/types"
+    ],
     "noEmit": true,
     "skipLibCheck": true
   },

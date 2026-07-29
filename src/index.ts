@@ -1,5 +1,5 @@
 type Region = "north" | "central" | "isan" | "south" | "bangkok";
-type Env = {
+export type Env = {
   DB: D1Database; SLIPS: R2Bucket; OCR_JOBS: Queue; AI: Ai;
   ADMIN_PASSWORD?: string; CONFIG_ENCRYPTION_KEY?: string;
 };
@@ -40,12 +40,19 @@ type OcrLogRow = {
   image_set_id: string | null;
   image_set_index: number | null;
   image_set_total: number | null;
+  reply_token_age_ms: number | null;
+  reply_token_source_slip_id: string | null;
   created_at: string;
   updated_at: string;
 };
 type DailyUsageRow = { region?: Region; provider: string; request_count: number; success_count: number; error_count: number };
 type OcrSpaceUsageRow = { region: Region; request_count: number };
 type OcrSpaceKeyReservation = { keyRegion: Region; apiKey: string };
+type LatestReplyTokenRow = {
+  id: string;
+  line_reply_token: string;
+  received_at_ms: number;
+};
 type LineImageSet = { id?: string; index?: number; total?: number };
 type LineEvent = {
   type?: string;
@@ -78,6 +85,7 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const JOB_REFERENCE_MINUTES = 30;
 const PASS_CLAIM_MINUTES = 2;
+export const REPLY_TOKEN_WARNING_MS = 50_000;
 const OCRSPACE_DAILY_LIMIT = 500;
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 export const MAX_OCR_ATTEMPTS = 2;
@@ -109,6 +117,9 @@ function cookie(request: Request, key: string) { return request.headers.get("coo
 export function shouldRetryOcr(attempt: number) { return attempt < MAX_OCR_ATTEMPTS; }
 export function imageTooLarge(size: number) { return !Number.isFinite(size) || size > MAX_IMAGE_BYTES; }
 export function imageExpired(uploaded: Date, now = Date.now()) { return now - uploaded.getTime() >= R2_FALLBACK_RETENTION_MS; }
+export function replyTokenAgeMs(eventTimestampMs: number, now = Date.now()) {
+  return Math.max(0, now - eventTimestampMs);
+}
 
 function imageBase64(bytes: Uint8Array) {
   const chunks: string[] = [];
@@ -178,8 +189,8 @@ async function config(env: Env, region: Region): Promise<RegionConfig> {
   if (!row) throw new Error("unknown region configuration");
   return { region, enabled: Boolean(row.enabled), lineSecret: await open(row.line_channel_secret, env), lineToken: await open(row.line_channel_token, env), ocrKey: await open(row.ocrspace_api_key, env) };
 }
-async function audit(env: Env, event: string, detail: string, region?: Region) { await env.DB.prepare("INSERT INTO audit_logs(region,event_type,detail) VALUES(?,?,?)").bind(region ?? null, event, detail.slice(0, 1000)).run(); }
-async function reserveOcrSpaceUsage(env: Env, region: Region) {
+async function audit(env: Pick<Env, "DB">, event: string, detail: string, region?: Region) { await env.DB.prepare("INSERT INTO audit_logs(region,event_type,detail) VALUES(?,?,?)").bind(region ?? null, event, detail.slice(0, 1000)).run(); }
+export async function reserveOcrSpaceUsage(env: Pick<Env, "DB">, region: Region) {
   await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,'ocrspace')")
     .bind(today(), region).run();
   const reserved = await env.DB.prepare("UPDATE daily_usage SET request_count=request_count+1 WHERE usage_date=? AND region=? AND provider='ocrspace' AND request_count<?")
@@ -357,28 +368,49 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
     const id = crypto.randomUUID();
     const r2Key = `${region}/${today()}/${id}.jpg`;
     const imageSet = imageSetMetadata(event);
+    const replyTokenReceivedAtMs = Date.now();
     const inserted = await env.DB.prepare(`INSERT INTO slip_jobs(
         id,region,parent_job_id,line_message_id,line_user_id,r2_key,
         line_reply_token,line_quote_token,webhook_event_id,
-        image_set_id,image_set_index,image_set_total
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        image_set_id,image_set_index,image_set_total,reply_token_received_at_ms
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(region,line_message_id) DO NOTHING`)
       .bind(
         id, region, parent.id, messageId, userId, r2Key,
         event.replyToken, event.message.quoteToken ?? null, event.webhookEventId ?? null,
-        imageSet.id, imageSet.index, imageSet.total
+        imageSet.id, imageSet.index, imageSet.total, replyTokenReceivedAtMs
       ).run();
     if ((inserted.meta.changes ?? 0) !== 1) {
       await env.DB.prepare(`UPDATE slip_jobs SET
           line_reply_token=?,
           line_quote_token=COALESCE(?,line_quote_token),
           webhook_event_id=COALESCE(?,webhook_event_id),
+          reply_token_received_at_ms=?,
           updated_at=CURRENT_TIMESTAMP
-        WHERE region=? AND line_message_id=? AND status='queued'`)
-        .bind(event.replyToken, event.message.quoteToken ?? null, event.webhookEventId ?? null, region, messageId).run();
-      const duplicate = await env.DB.prepare("SELECT id,status FROM slip_jobs WHERE region=? AND line_message_id=?")
-        .bind(region, messageId).first<{ id: string; status: string }>();
-      if (duplicate?.status === "queued") {
+        WHERE region=? AND line_message_id=? AND EXISTS (
+          SELECT 1 FROM user_jobs u
+          WHERE u.id=slip_jobs.parent_job_id AND u.result_sent_at IS NULL
+        )`)
+        .bind(
+          event.replyToken,
+          event.message.quoteToken ?? null,
+          event.webhookEventId ?? null,
+          replyTokenReceivedAtMs,
+          region,
+          messageId
+        ).run();
+      const duplicate = await env.DB.prepare(`SELECT
+          s.id,s.status,u.result_sent_at
+        FROM slip_jobs s
+        JOIN user_jobs u ON u.id=s.parent_job_id
+        WHERE s.region=? AND s.line_message_id=?`)
+        .bind(region, messageId)
+        .first<{ id: string; status: string; result_sent_at: string | null }>();
+      if (duplicate && (
+        duplicate.status === "queued" ||
+        (!duplicate.result_sent_at &&
+          (duplicate.status === "passed" || duplicate.status === "failed"))
+      )) {
         await env.OCR_JOBS.send({ id: duplicate.id, region });
       }
       await audit(
@@ -718,7 +750,31 @@ async function runWorkersAiVision(env: Env, imageBytes: ArrayBuffer) {
   return analyzeWorkersAiTranscription(response);
 }
 
-async function deliverResult(env: Env, row: SlipProcessRow, token: string, result: "passed" | "failed") {
+export async function latestReplyToken(db: D1Database, parentJobId: string) {
+  return db.prepare(`SELECT
+      id,
+      line_reply_token,
+      COALESCE(
+        reply_token_received_at_ms,
+        CAST(strftime('%s',created_at) AS INTEGER) * 1000
+      ) AS received_at_ms
+    FROM slip_jobs
+    WHERE parent_job_id=?
+      AND line_reply_token IS NOT NULL
+      AND reply_token_used_at IS NULL
+    ORDER BY
+      COALESCE(
+        reply_token_received_at_ms,
+        CAST(strftime('%s',created_at) AS INTEGER) * 1000
+      ) DESC,
+      created_at DESC,
+      rowid DESC
+    LIMIT 1`)
+    .bind(parentJobId)
+    .first<LatestReplyTokenRow>();
+}
+
+export async function deliverResult(env: Pick<Env, "DB">, row: SlipProcessRow, token: string, result: "passed" | "failed") {
   if (row.result_sent_at) return;
   const claimToken = crypto.randomUUID();
   const claimed = await env.DB.prepare(`UPDATE user_jobs SET
@@ -738,12 +794,35 @@ async function deliverResult(env: Env, row: SlipProcessRow, token: string, resul
     throw new Error("result delivery claim is busy");
   }
   try {
-    await replyInspectionResult(token, row, result);
+    const selectedReply = await latestReplyToken(env.DB, row.parent_job_id);
+    if (!selectedReply?.line_reply_token) throw new Error("LINE reply token is unavailable");
+    const tokenAgeMs = replyTokenAgeMs(selectedReply.received_at_ms);
+    await audit(
+      env,
+      "reply_token_selected",
+      `${row.job_number}: age_ms=${tokenAgeMs}, source=${selectedReply.id}`,
+      row.region
+    );
+    if (tokenAgeMs >= REPLY_TOKEN_WARNING_MS) {
+      await audit(
+        env,
+        "reply_token_age_warning",
+        `${row.job_number}: reply token age ${Math.round(tokenAgeMs / 1000)} seconds`,
+        row.region
+      );
+    }
+    await replyInspectionResult(
+      token,
+      { ...row, line_reply_token: selectedReply.line_reply_token },
+      result
+    );
     await env.DB.batch([
       env.DB.prepare("UPDATE user_jobs SET status=?,final_result=?,result_sent_at=CURRENT_TIMESTAMP,result_claimed_at=NULL,result_claim_token=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND result_claim_token=?")
         .bind(result, result, row.parent_job_id, claimToken),
-      env.DB.prepare("UPDATE slip_jobs SET replied_at=CURRENT_TIMESTAMP WHERE id=? AND replied_at IS NULL")
-        .bind(row.id)
+      env.DB.prepare("UPDATE slip_jobs SET replied_at=CURRENT_TIMESTAMP,reply_token_age_ms=?,reply_token_source_slip_id=? WHERE id=? AND replied_at IS NULL")
+        .bind(tokenAgeMs, selectedReply.id, row.id),
+      env.DB.prepare("UPDATE slip_jobs SET reply_token_used_at=CURRENT_TIMESTAMP WHERE id=? AND reply_token_used_at IS NULL")
+        .bind(selectedReply.id)
     ]);
   } catch (error) {
     await env.DB.prepare("UPDATE user_jobs SET status='collecting',final_result=NULL,result_claimed_at=NULL,result_claim_token=NULL WHERE id=? AND result_claim_token=? AND result_sent_at IS NULL")
@@ -1178,8 +1257,9 @@ export function dashboardHtml() { return `<!doctype html>
         const imageSet=item.imageSetTotal?'<span class="fact">รูปในชุด: '+escapeHtml((item.imageSetIndex??'?')+'/'+item.imageSetTotal)+'</span>':'';
         const ocrAmounts=(item.ocrspaceDetectedAmounts||[]).join(', ')||'ไม่พบ';
         const ocrKey=item.ocrKeyRegion?'<span class="fact">OCR Key: '+escapeHtml(meta[item.ocrKeyRegion]?.name||item.ocrKeyRegion)+'</span>':'';
+        const replyTokenAge=item.replyTokenAgeMs===null||item.replyTokenAgeMs===undefined?'':'<span class="fact '+(item.replyTokenAgeMs>=50000?'no':'yes')+'">Reply Token: '+escapeHtml((item.replyTokenAgeMs/1000).toFixed(1))+' วินาที</span>';
         const aiFacts=item.aiProvider?fact('AI KPLUS/K+',item.aiFoundKplus)+fact('AI SETTLEMENT',item.aiFoundSettlement)+'<span class="fact">AI ยอด: '+escapeHtml((item.aiDetectedAmounts||[]).join(', ')||'ไม่พบ')+'</span><span class="fact">AI มั่นใจ: '+(item.aiConfident?'ใช่':'ไม่')+'</span>':'';
-        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(providerName(item.provider))+'</span>'+ocrKey+imageSet+fact('OCR KPLUS/K+',item.ocrspaceFoundKplus)+fact('OCR SETTLEMENT',item.ocrspaceFoundSettlement)+'<span class="fact">OCR ยอด: '+escapeHtml(ocrAmounts)+'</span>'+aiFacts+'<span class="fact">ผลสุดท้าย ยอด: '+escapeHtml(amounts)+'</span></div>'+ocrDetail+aiDetail+'</article>'
+        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(providerName(item.provider))+'</span>'+ocrKey+replyTokenAge+imageSet+fact('OCR KPLUS/K+',item.ocrspaceFoundKplus)+fact('OCR SETTLEMENT',item.ocrspaceFoundSettlement)+'<span class="fact">OCR ยอด: '+escapeHtml(ocrAmounts)+'</span>'+aiFacts+'<span class="fact">ผลสุดท้าย ยอด: '+escapeHtml(amounts)+'</span></div>'+ocrDetail+aiDetail+'</article>'
       }).join('')
     }
     async function loadLogs(){
@@ -1292,7 +1372,9 @@ async function admin(request: Request, env: Env, url: URL) {
         s.ocrspace_key_region,
         s.ai_provider,substr(s.ai_response,1,500) AS ai_response_excerpt,
         s.ai_found_kplus,s.ai_found_settlement,s.ai_detected_amounts,s.ai_confident,
-        s.image_set_id,s.image_set_index,s.image_set_total,s.created_at,s.updated_at
+        s.image_set_id,s.image_set_index,s.image_set_total,
+        s.reply_token_age_ms,s.reply_token_source_slip_id,
+        s.created_at,s.updated_at
       FROM slip_jobs s
       JOIN user_jobs u ON u.id=s.parent_job_id
       WHERE s.region=?
@@ -1325,6 +1407,8 @@ async function admin(request: Request, env: Env, url: URL) {
       imageSetId: row.image_set_id,
       imageSetIndex: row.image_set_index,
       imageSetTotal: row.image_set_total,
+      replyTokenAgeMs: row.reply_token_age_ms,
+      replyTokenSourceSlipId: row.reply_token_source_slip_id,
       createdAt: row.created_at,
       updatedAt: row.updated_at
     })));
