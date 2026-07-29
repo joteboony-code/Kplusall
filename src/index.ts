@@ -76,8 +76,7 @@ const dec = new TextDecoder();
 const JOB_REFERENCE_MINUTES = 30;
 const PASS_CLAIM_MINUTES = 2;
 const OCRSPACE_DAILY_LIMIT = 500;
-export const MAX_IMAGES_PER_JOB = 20;
-export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 export const MAX_OCR_ATTEMPTS = 2;
 const R2_FALLBACK_RETENTION_MS = 24 * 60 * 60 * 1000;
 const WORKERS_AI_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
@@ -90,7 +89,18 @@ If no text is readable, return NONE.`;
 function json(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } }); }
 function b64(bytes: Uint8Array) { let s = ""; bytes.forEach((b) => s += String.fromCharCode(b)); return btoa(s); }
 function unb64(text: string) { const s = atob(text); return Uint8Array.from(s, (c) => c.charCodeAt(0)); }
-function today() { return new Date().toISOString().slice(0, 10); }
+export function bangkokDate(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value ?? "";
+  return `${value("year")}-${value("month")}-${value("day")}`;
+}
+function today() { return bangkokDate(); }
 function isRegion(value: string): value is Region { return REGIONS.includes(value as Region); }
 function cookie(request: Request, key: string) { return request.headers.get("cookie")?.split(";").map((v) => v.trim()).find((v) => v.startsWith(`${key}=`))?.slice(key.length + 1); }
 export function shouldRetryOcr(attempt: number) { return attempt < MAX_OCR_ATTEMPTS; }
@@ -295,15 +305,12 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
         id,region,parent_job_id,line_message_id,line_user_id,r2_key,
         line_reply_token,line_quote_token,webhook_event_id,
         image_set_id,image_set_index,image_set_total
-      )
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?
-      WHERE (SELECT COUNT(*) FROM slip_jobs WHERE parent_job_id=?) < ?
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(region,line_message_id) DO NOTHING`)
       .bind(
         id, region, parent.id, messageId, userId, r2Key,
         event.replyToken, event.message.quoteToken ?? null, event.webhookEventId ?? null,
-        imageSet.id, imageSet.index, imageSet.total,
-        parent.id, MAX_IMAGES_PER_JOB
+        imageSet.id, imageSet.index, imageSet.total
       ).run();
     if ((inserted.meta.changes ?? 0) !== 1) {
       await env.DB.prepare(`UPDATE slip_jobs SET
@@ -320,8 +327,8 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
       }
       await audit(
         env,
-        duplicate ? "image_duplicate_ignored" : "image_limit_ignored",
-        duplicate ? messageId : `${parent.job_number}: เกิน ${MAX_IMAGES_PER_JOB} รูป`,
+        "image_duplicate_ignored",
+        messageId,
         region
       );
       continue;
@@ -387,12 +394,35 @@ function receiptAmounts(text: string) {
   )];
 }
 
-export function analyzeOcr(text: string): OcrAnalysis {
+function hasThaiQrPaymentText(normalized: string) {
+  return /\b(?:THAI\s*QR(?:\s*PAYMENT)?|QR\s*PAYMENT)\b/.test(normalized);
+}
+
+function isKplusCandidateText(normalized: string) {
+  return (
+    /\bKPLUS\b/.test(normalized) ||
+    /(?:^|[^A-Z0-9])K\s*\+(?:[^A-Z0-9]|$)/.test(normalized)
+  );
+}
+
+function isConfirmedKplusReceiptText(normalized: string) {
+  const hasStandaloneKplusLogo =
+    /(?:^|[^A-Z0-9])K\s*\+(?:[^A-Z0-9]|$)/.test(normalized);
+  if (hasStandaloneKplusLogo) return true;
+  if (!/\bKPLUS\b/.test(normalized)) return false;
+  return (
+    /\b(?:CHANNEL|HOST|CARD\s*NAME)\s*:?\s*KPLUS\b/.test(normalized) ||
+    hasThaiQrPaymentText(normalized)
+  );
+}
+
+export function analyzeOcr(text: string, requireConfirmedBrand = false): OcrAnalysis {
   const normalized = normalizeOcrText(text);
   const foundKplus =
-    /\bKPLUS\b/.test(normalized) ||
-    /(?:^|[^A-Z0-9])K\s*\+(?:[^A-Z0-9]|$)/.test(normalized) ||
-    /\b(?:THAI\s*QR(?:\s*PAYMENT)?|QR\s*PAYMENT)\b/.test(normalized);
+    (requireConfirmedBrand
+      ? isConfirmedKplusReceiptText(normalized)
+      : isKplusCandidateText(normalized)) ||
+    hasThaiQrPaymentText(normalized);
   const foundSettlement = /\bSETTLEMENT\b/.test(normalized);
   const amounts = receiptAmounts(text);
   const matched = amounts.find((amount) => Math.abs(Math.abs(amount) - 1.22) < 0.005);
@@ -420,7 +450,9 @@ export function analyzeOcr(text: string): OcrAnalysis {
 export function classify(text: string) { return analyzeOcr(text).result; }
 
 export function shouldUseWorkersAi(analysis: OcrAnalysis) {
-  return analysis.result !== "passed" && (analysis.foundKplus || analysis.foundSettlement);
+  return analysis.result !== "passed" &&
+    analysis.foundKplus &&
+    analysis.foundSettlement;
 }
 
 type WorkersAiVisionAnalysis = OcrAnalysis & { confident: boolean; rawText: string };
@@ -561,12 +593,6 @@ export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalys
   const matchedAmount = detectedAmounts.find((amount) => Math.abs(Math.abs(Number(amount)) - 1.22) < 0.005) ?? null;
 
   if (!aiCanConfirm) {
-    if (ocr.result === "failed") {
-      return {
-        ...ocr,
-        reason: `${ocr.reason}; Workers AI Vision อ่านเพิ่มไม่ได้ จึงคงผลไม่ผ่านจาก OCR.space`
-      };
-    }
     return {
       result: "needs_fallback",
       foundKplus,
@@ -804,7 +830,7 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
     await deleteCachedImage(env, row);
     return;
   }
-  const analysis = analyzeOcr(text);
+  const analysis = analyzeOcr(text, true);
   let finalAnalysis = analysis;
   let aiAnalysis: WorkersAiVisionAnalysis | null = null;
   if (shouldUseWorkersAi(analysis)) {

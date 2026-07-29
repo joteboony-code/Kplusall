@@ -37,10 +37,17 @@ describe("original KPLUS settlement rules", () => {
 
   it("uses Workers AI only for unresolved images with receipt evidence", () => {
     expect(shouldUseWorkersAi(analyzeOcr("random equipment photo"))).toBe(false);
-    expect(shouldUseWorkersAi(analyzeOcr("KPLUS amount unreadable"))).toBe(true);
-    expect(shouldUseWorkersAi(analyzeOcr("SETTLEMENT amount unreadable"))).toBe(true);
+    expect(shouldUseWorkersAi(analyzeOcr("KPLUS amount unreadable"))).toBe(false);
+    expect(shouldUseWorkersAi(analyzeOcr("SETTLEMENT amount unreadable"))).toBe(false);
     expect(shouldUseWorkersAi(analyzeOcr("KPLUS SETTLEMENT 9.99"))).toBe(true);
     expect(shouldUseWorkersAi(analyzeOcr("KPLUS SETTLEMENT 1.22"))).toBe(false);
+  });
+
+  it("uses the stricter original Kplus122 brand confirmation for OCR.space", () => {
+    expect(analyzeOcr("KPLUS\nSETTLEMENT\n1.22", true).result).toBe("silent");
+    expect(analyzeOcr("CHANNEL: KPLUS\nSETTLEMENT\n1.22", true).result).toBe("passed");
+    expect(analyzeOcr("K+\nSETTLEMENT\n-1.22", true).result).toBe("passed");
+    expect(analyzeOcr("Thai QR Payment\nSETTLEMENT\n1.22", true).result).toBe("passed");
   });
 
   it("accepts a confident Workers AI confirmation of the target amount", () => {
@@ -133,16 +140,15 @@ VOID -THB 1.22`);
     expect(mergeOcrAndWorkersAi(ocr, ai).result).toBe("needs_fallback");
   });
 
-  it("keeps a conclusive OCR.space failure when Workers AI cannot read more", () => {
+  it("does not send an OCR.space failure when Workers AI cannot confirm it", () => {
     const ocr = analyzeOcr("CHANNEL: KPLUS\nSETTLEMENT\nTOTAL THB 60.00\nVOID -THB 60.00");
     const ai = analyzeWorkersAiTranscription("NONE");
 
     expect(mergeOcrAndWorkersAi(ocr, ai)).toMatchObject({
-      result: "failed",
+      result: "needs_fallback",
       foundKplus: true,
       foundSettlement: true,
-      matchedAmount: null,
-      detectedAmounts: ["60.00", "-60.00"]
+      matchedAmount: null
     });
   });
 

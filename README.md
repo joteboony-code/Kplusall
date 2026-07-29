@@ -24,8 +24,8 @@ rule is a final safety net.
 ## Operational safety
 
 - LINE receives HTTP 200 only after D1 persistence and Queue submission succeed.
-- One TID accepts at most 20 images.
-- Images larger than 5 MiB are rejected before OCR and Workers AI.
+- One TID has no application-level image-count limit.
+- Images larger than 8 MiB are rejected before OCR and Workers AI.
 - OCR.space errors are retried once, for two attempts total.
 
 ตรวจสอบกฎที่ใช้งานจริง:
@@ -42,8 +42,8 @@ npx wrangler r2 bucket lifecycle list kplusall-slips
 4. ใช้ OCR.space ของ region นั้นเป็นด่านแรก.
    ระบบจองโควตาใน D1 ก่อนเรียก OCR และหยุดอัตโนมัติที่ 500 รูปต่อภูมิภาคต่อวัน.
 5. หลักฐาน `KPLUS`, `K+`, `THAIQR`, `Thai QR Payment` หรือ `QR PAYMENT` พร้อม `SETTLEMENT` และยอด `1.22` หรือ `-1.22` => `passed`.
-6. หาก OCR.space ตัดสินไม่ได้แต่พบ KPLUS/K+ หรือ `SETTLEMENT` อย่างน้อยหนึ่งอย่าง ระบบส่งรูปนั้นให้ Workers AI Vision ตรวจซ้ำ; รูปที่ไม่มีหลักฐานทั้งสองอย่างไม่ใช้ AI.
-7. Workers AI Vision ถอดเฉพาะข้อความที่มองเห็นเหมือนระบบ Kplus122 เดิม แล้วกฎ deterministic รวมหลักฐานกับ OCR.space; AI ไม่มีสิทธิ์ลบผลที่ OCR.space ยืนยันแล้ว. ยอด `1.22`/`-1.22` => `passed`, ยอดอื่นที่อ่านชัด => `failed`, หลักฐานไม่ครบ => `needs_fallback`.
+6. หาก OCR.space พบหลักฐาน KPLUS/K+ และ `SETTLEMENT` ครบแต่ยังตัดสินไม่ได้ ระบบส่งรูปนั้นให้ Workers AI Vision ตรวจซ้ำ; รูปที่มีหลักฐานเพียงอย่างเดียวไม่ใช้ AI.
+7. Workers AI Vision ถอดเฉพาะข้อความที่มองเห็นเหมือนระบบ Kplus122 เดิม แล้วกฎ deterministic รวมหลักฐานกับ OCR.space. ผลผ่านจาก OCR.space ตอบได้ทันที ส่วนผลไม่ผ่านต้องมีหลักฐานจาก Workers AI เพิ่ม; หาก Workers AI ยืนยันไม่ได้ => `needs_fallback` และไม่ตอบ LINE.
 8. ระหว่างรับเลขงานและรับรูป ระบบไม่ส่งข้อความตอบรับ.
 9. ระบบส่งผลผ่านหรือไม่ผ่านด้วย LINE Reply API เท่านั้น และใช้ D1 claim เพื่อไม่ตอบซ้ำแม้หลายรูปจบพร้อมกัน.
 10. รูปที่เริ่มประมวลผลหลังงานแจ้งผลแล้วจะหยุดตรวจเพื่อประหยัดโควตา แต่ยังมีรายการใน Log.
