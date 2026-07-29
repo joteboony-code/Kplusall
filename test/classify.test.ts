@@ -152,6 +152,34 @@ VOID -THB 1.22`);
     });
   });
 
+  it("does not fail when Workers AI sees only a marker but cannot confirm the wrong amount", () => {
+    const ocr = analyzeOcr("CHANNEL: KPLUS\nSETTLEMENT\nTOTAL THB 60.00");
+    const ai = analyzeWorkersAiTranscription("KPLUS");
+
+    expect(mergeOcrAndWorkersAi(ocr, ai).result).toBe("needs_fallback");
+  });
+
+  it("does not fail when OCR.space and Workers AI read different wrong amounts", () => {
+    const ocr = analyzeOcr("CHANNEL: KPLUS\nSETTLEMENT\nTOTAL THB 60.00");
+    const ai = analyzeWorkersAiTranscription(
+      "CHANNEL: KPLUS\nSETTLEMENT\nTOTAL THB 40.00"
+    );
+
+    expect(mergeOcrAndWorkersAi(ocr, ai).result).toBe("needs_fallback");
+  });
+
+  it("fails when OCR.space and Workers AI confirm the same wrong amount", () => {
+    const ocr = analyzeOcr("CHANNEL: KPLUS\nSETTLEMENT\nTOTAL THB 60.00");
+    const ai = analyzeWorkersAiTranscription(
+      "CHANNEL: KPLUS\nSETTLEMENT\nTOTAL THB 60.00"
+    );
+
+    expect(mergeOcrAndWorkersAi(ocr, ai)).toMatchObject({
+      result: "failed",
+      detectedAmounts: ["60.00"]
+    });
+  });
+
   it("uses the original Kplus122 transcription-only Workers AI rule", () => {
     expect(VISIBLE_TEXT_PROMPT).not.toContain("KPLUS");
     expect(VISIBLE_TEXT_PROMPT).not.toContain("SETTLEMENT");

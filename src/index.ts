@@ -591,6 +591,18 @@ export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalys
     ...(aiCanConfirm ? ai.detectedAmounts : [])
   ])].slice(0, 12);
   const matchedAmount = detectedAmounts.find((amount) => Math.abs(Math.abs(Number(amount)) - 1.22) < 0.005) ?? null;
+  const confirmedWrongAmount = ocr.detectedAmounts.find((ocrAmount) => {
+    const numericOcrAmount = Number(ocrAmount);
+    if (!Number.isFinite(numericOcrAmount) ||
+        Math.abs(Math.abs(numericOcrAmount) - 1.22) < 0.005) {
+      return false;
+    }
+    return ai.detectedAmounts.some((aiAmount) => {
+      const numericAiAmount = Number(aiAmount);
+      return Number.isFinite(numericAiAmount) &&
+        Math.abs(numericOcrAmount - numericAiAmount) < 0.005;
+    });
+  });
 
   if (!aiCanConfirm) {
     return {
@@ -612,14 +624,14 @@ export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalys
       reason: `OCR.space และ Workers AI Vision ยืนยันร่วมกัน: พบ KPLUS, SETTLEMENT และยอด ${matchedAmount}`
     };
   }
-  if (foundKplus && foundSettlement && detectedAmounts.length > 0) {
+  if (foundKplus && foundSettlement && confirmedWrongAmount !== undefined) {
     return {
       result: "failed",
       foundKplus,
       foundSettlement,
       matchedAmount,
       detectedAmounts,
-      reason: "OCR.space และ Workers AI Vision ยืนยันร่วมกัน: พบ KPLUS และ SETTLEMENT แต่ยอดไม่ใช่ 1.22 หรือ -1.22"
+      reason: `OCR.space และ Workers AI Vision ยืนยันยอดอื่นตรงกัน: ${confirmedWrongAmount} บาท`
     };
   }
   return {
