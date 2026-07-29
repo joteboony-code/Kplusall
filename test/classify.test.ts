@@ -43,6 +43,27 @@ describe("original KPLUS settlement rules", () => {
     expect(shouldUseWorkersAi(analyzeOcr("KPLUS SETTLEMENT 1.22"))).toBe(false);
   });
 
+  it("uses Workers AI when OCR.space is unavailable, matching Kplus122", () => {
+    const noOcrEvidence = analyzeOcr("");
+
+    expect(shouldUseWorkersAi(noOcrEvidence, true)).toBe(true);
+    expect(shouldUseWorkersAi(noOcrEvidence, false)).toBe(false);
+  });
+
+  it("can pass from Workers AI alone when OCR.space returned no usable result", () => {
+    const noOcrEvidence = analyzeOcr("");
+    const ai = analyzeWorkersAiTranscription(
+      "CHANNEL: KPLUS\nSETTLEMENT\nAMT: THB 1.22"
+    );
+
+    expect(mergeOcrAndWorkersAi(noOcrEvidence, ai)).toMatchObject({
+      result: "passed",
+      foundKplus: true,
+      foundSettlement: true,
+      matchedAmount: "1.22"
+    });
+  });
+
   it("uses the stricter original Kplus122 brand confirmation for OCR.space", () => {
     expect(analyzeOcr("KPLUS\nSETTLEMENT\n1.22", true).result).toBe("silent");
     expect(analyzeOcr("CHANNEL: KPLUS\nSETTLEMENT\n1.22", true).result).toBe("passed");

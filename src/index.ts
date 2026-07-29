@@ -544,10 +544,21 @@ export function analyzeOcr(text: string, requireConfirmedBrand = false): OcrAnal
 }
 export function classify(text: string) { return analyzeOcr(text).result; }
 
-export function shouldUseWorkersAi(analysis: OcrAnalysis) {
-  return analysis.result !== "passed" &&
+export function shouldUseWorkersAi(analysis: OcrAnalysis, ocrUnavailable = false) {
+  return ocrUnavailable || (analysis.result !== "passed" &&
     analysis.foundKplus &&
-    analysis.foundSettlement;
+    analysis.foundSettlement);
+}
+
+function unavailableOcrAnalysis(reason: string): OcrAnalysis {
+  return {
+    result: "needs_fallback",
+    foundKplus: false,
+    foundSettlement: false,
+    matchedAmount: null,
+    detectedAmounts: [],
+    reason
+  };
 }
 
 type WorkersAiVisionAnalysis = OcrAnalysis & { confident: boolean; rawText: string };
@@ -757,6 +768,104 @@ async function runWorkersAiVision(env: Env, imageBytes: ArrayBuffer) {
   return analyzeWorkersAiTranscription(response);
 }
 
+async function completeImageAnalysis(
+  env: Env,
+  row: SlipProcessRow,
+  lineToken: string,
+  imageBytes: ArrayBuffer,
+  ocrText: string,
+  analysis: OcrAnalysis,
+  ocrKeyRegion: Region | null,
+  ocrUnavailable = false
+) {
+  let finalAnalysis = analysis;
+  let aiAnalysis: WorkersAiVisionAnalysis | null = null;
+  if (shouldUseWorkersAi(analysis, ocrUnavailable)) {
+    await beginWorkersAiUsage(env, row.region);
+    try {
+      aiAnalysis = await runWorkersAiVision(env, imageBytes);
+      await recordWorkersAiOutcome(env, row.region, true);
+      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
+      await audit(env, `workers_ai_${finalAnalysis.result}`, row.job_number, row.region);
+    } catch (error) {
+      await recordWorkersAiOutcome(env, row.region, false);
+      const detail = error instanceof Error ? error.message : String(error);
+      aiAnalysis = {
+        result: "needs_fallback",
+        foundKplus: false,
+        foundSettlement: false,
+        matchedAmount: null,
+        detectedAmounts: [],
+        confident: false,
+        rawText: detail,
+        reason: `Workers AI Vision ผิดพลาด: ${detail}`.slice(0, 1000)
+      };
+      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
+      await audit(env, "workers_ai_error", detail, row.region);
+    }
+  }
+  const provider = aiAnalysis
+    ? (ocrUnavailable ? WORKERS_AI_PROVIDER : `ocrspace+${WORKERS_AI_PROVIDER}`)
+    : "ocrspace";
+  await env.DB.prepare(`UPDATE slip_jobs SET
+      status=?,
+      ocr_provider=?,
+      ocr_text=?,
+      result=?,
+      found_kplus=?,
+      found_settlement=?,
+      matched_amount=?,
+      detected_amounts=?,
+      decision_reason=?,
+      ocrspace_found_kplus=?,
+      ocrspace_found_settlement=?,
+      ocrspace_detected_amounts=?,
+      ocrspace_key_region=?,
+      ai_provider=?,
+      ai_response=?,
+      ai_found_kplus=?,
+      ai_found_settlement=?,
+      ai_detected_amounts=?,
+      ai_confident=?,
+      updated_at=CURRENT_TIMESTAMP
+    WHERE id=?`)
+    .bind(
+      finalAnalysis.result,
+      provider,
+      ocrText.slice(0, 10000),
+      finalAnalysis.result,
+      finalAnalysis.foundKplus ? 1 : 0,
+      finalAnalysis.foundSettlement ? 1 : 0,
+      finalAnalysis.matchedAmount,
+      JSON.stringify(finalAnalysis.detectedAmounts),
+      finalAnalysis.reason,
+      analysis.foundKplus ? 1 : 0,
+      analysis.foundSettlement ? 1 : 0,
+      JSON.stringify(analysis.detectedAmounts),
+      ocrKeyRegion,
+      aiAnalysis ? WORKERS_AI_PROVIDER : null,
+      aiAnalysis?.rawText.slice(0, 10000) ?? null,
+      aiAnalysis ? (aiAnalysis.foundKplus ? 1 : 0) : null,
+      aiAnalysis ? (aiAnalysis.foundSettlement ? 1 : 0) : null,
+      aiAnalysis ? JSON.stringify(aiAnalysis.detectedAmounts) : null,
+      aiAnalysis ? (aiAnalysis.confident ? 1 : 0) : null,
+      row.id
+    ).run();
+  await deleteCachedImage(env, row);
+  if (finalAnalysis.result === "passed" || finalAnalysis.result === "failed") {
+    row.matched_amount = finalAnalysis.matchedAmount;
+    row.detected_amounts = JSON.stringify(finalAnalysis.detectedAmounts);
+    row.decision_reason = finalAnalysis.reason;
+    await deliverResult(env, row, lineToken, finalAnalysis.result);
+  }
+  await audit(
+    env,
+    ocrUnavailable ? "ocr_unavailable_fallback" : `ocr_${analysis.result}`,
+    row.job_number,
+    row.region
+  );
+}
+
 export async function latestReplyToken(db: D1Database, parentJobId: string) {
   return db.prepare(`SELECT
       id,
@@ -865,7 +974,8 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
   const row = await env.DB.prepare("SELECT s.*,u.job_number,u.line_source_type,u.result_sent_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?")
     .bind(data.id, data.region).first<SlipProcessRow>();
   if (!row) return;
-  const c = await config(env, data.region); if (!c.enabled || !c.ocrKey || !c.lineToken) throw new Error("region configuration unavailable");
+  const c = await config(env, data.region);
+  if (!c.enabled || !c.lineToken) throw new Error("region configuration unavailable");
   if ((row.status === "passed" || row.status === "failed") && !row.result_sent_at) {
     await deleteCachedImage(env, row);
     await deliverResult(env, row, c.lineToken, row.status);
@@ -919,10 +1029,20 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
   }
   const ocrReservation = await reserveOcrSpaceKey(env, data.region);
   if (!ocrReservation) {
-    await env.DB.prepare("UPDATE slip_jobs SET status='quota_exhausted',result='needs_fallback',ocr_provider='ocrspace',ocrspace_key_region=NULL,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-      .bind(`OCR.space ทุกภูมิภาคที่เปิดใช้งานครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน`, row.id).run();
     await audit(env, "ocr_pool_quota_exhausted", row.job_number, data.region);
-    await deleteCachedImage(env, row);
+    const unavailable = unavailableOcrAnalysis(
+      `OCR.space ทุกภูมิภาคที่เปิดใช้งานครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน จึงส่งต่อ Workers AI`
+    );
+    await completeImageAnalysis(
+      env,
+      row,
+      c.lineToken,
+      imageBytes,
+      "",
+      unavailable,
+      null,
+      true
+    );
     return;
   }
   const ocrKeyRegion = ocrReservation.keyRegion;
@@ -961,7 +1081,19 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
         `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
         row.id
       ).run();
-    await deleteCachedImage(env, row);
+    const unavailable = unavailableOcrAnalysis(
+      `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง จึงส่งต่อ Workers AI: ${errorDetail}`.slice(0, 1000)
+    );
+    await completeImageAnalysis(
+      env,
+      row,
+      c.lineToken,
+      imageBytes,
+      errorDetail,
+      unavailable,
+      ocrKeyRegion,
+      true
+    );
     return;
   }
   let payload: any;
@@ -995,88 +1127,31 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
         `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
         row.id
       ).run();
-    await deleteCachedImage(env, row);
+    const unavailable = unavailableOcrAnalysis(
+      `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง จึงส่งต่อ Workers AI: ${errorDetail}`.slice(0, 1000)
+    );
+    await completeImageAnalysis(
+      env,
+      row,
+      c.lineToken,
+      imageBytes,
+      errorDetail,
+      unavailable,
+      ocrKeyRegion,
+      true
+    );
     return;
   }
   const analysis = analyzeOcr(text, true);
-  let finalAnalysis = analysis;
-  let aiAnalysis: WorkersAiVisionAnalysis | null = null;
-  if (shouldUseWorkersAi(analysis)) {
-    await beginWorkersAiUsage(env, data.region);
-    try {
-      aiAnalysis = await runWorkersAiVision(env, imageBytes);
-      await recordWorkersAiOutcome(env, data.region, true);
-      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
-      await audit(env, `workers_ai_${finalAnalysis.result}`, row.job_number, data.region);
-    } catch (error) {
-      await recordWorkersAiOutcome(env, data.region, false);
-      const detail = error instanceof Error ? error.message : String(error);
-      aiAnalysis = {
-        result: "needs_fallback",
-        foundKplus: false,
-        foundSettlement: false,
-        matchedAmount: null,
-        detectedAmounts: [],
-        confident: false,
-        rawText: detail,
-        reason: `Workers AI Vision ผิดพลาด: ${detail}`.slice(0, 1000)
-      };
-      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
-      await audit(env, "workers_ai_error", detail, data.region);
-    }
-  }
-  await env.DB.prepare(`UPDATE slip_jobs SET
-      status=?,
-      ocr_provider=?,
-      ocr_text=?,
-      result=?,
-      found_kplus=?,
-      found_settlement=?,
-      matched_amount=?,
-      detected_amounts=?,
-      decision_reason=?,
-      ocrspace_found_kplus=?,
-      ocrspace_found_settlement=?,
-      ocrspace_detected_amounts=?,
-      ocrspace_key_region=?,
-      ai_provider=?,
-      ai_response=?,
-      ai_found_kplus=?,
-      ai_found_settlement=?,
-      ai_detected_amounts=?,
-      ai_confident=?,
-      updated_at=CURRENT_TIMESTAMP
-    WHERE id=?`)
-    .bind(
-      finalAnalysis.result,
-      aiAnalysis ? "ocrspace+workers_ai_vision" : "ocrspace",
-      text.slice(0, 10000),
-      finalAnalysis.result,
-      finalAnalysis.foundKplus ? 1 : 0,
-      finalAnalysis.foundSettlement ? 1 : 0,
-      finalAnalysis.matchedAmount,
-      JSON.stringify(finalAnalysis.detectedAmounts),
-      finalAnalysis.reason,
-      analysis.foundKplus ? 1 : 0,
-      analysis.foundSettlement ? 1 : 0,
-      JSON.stringify(analysis.detectedAmounts),
-      ocrKeyRegion,
-      aiAnalysis ? WORKERS_AI_PROVIDER : null,
-      aiAnalysis?.rawText.slice(0, 10000) ?? null,
-      aiAnalysis ? (aiAnalysis.foundKplus ? 1 : 0) : null,
-      aiAnalysis ? (aiAnalysis.foundSettlement ? 1 : 0) : null,
-      aiAnalysis ? JSON.stringify(aiAnalysis.detectedAmounts) : null,
-      aiAnalysis ? (aiAnalysis.confident ? 1 : 0) : null,
-      row.id
-    ).run();
-  await deleteCachedImage(env, row);
-  if (finalAnalysis.result === "passed" || finalAnalysis.result === "failed") {
-    row.matched_amount = finalAnalysis.matchedAmount;
-    row.detected_amounts = JSON.stringify(finalAnalysis.detectedAmounts);
-    row.decision_reason = finalAnalysis.reason;
-    await deliverResult(env, row, c.lineToken, finalAnalysis.result);
-  }
-  await audit(env, `ocr_${analysis.result}`, row.job_number, data.region);
+  await completeImageAnalysis(
+    env,
+    row,
+    c.lineToken,
+    imageBytes,
+    text,
+    analysis,
+    ocrKeyRegion
+  );
 }
 
 function decodeAmounts(value: string | null) {
