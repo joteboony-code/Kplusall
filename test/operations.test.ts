@@ -5,6 +5,7 @@ import {
   imageTooLarge,
   MAX_IMAGE_BYTES,
   MAX_OCR_ATTEMPTS,
+  rankOcrSpaceKeyRegions,
   shouldRetryOcr
 } from "../src/index";
 
@@ -31,5 +32,23 @@ describe("operational safety limits", () => {
   it("resets daily usage at midnight in Bangkok", () => {
     expect(bangkokDate(new Date("2026-07-28T16:59:59.000Z"))).toBe("2026-07-28");
     expect(bangkokDate(new Date("2026-07-28T17:00:00.000Z"))).toBe("2026-07-29");
+  });
+
+  it("uses the region's own OCR.space key while it has capacity", () => {
+    expect(rankOcrSpaceKeyRegions("north", {
+      north: 499,
+      central: 10,
+      isan: 0
+    }, ["north", "central", "isan"])).toEqual(["north", "isan", "central"]);
+  });
+
+  it("borrows the configured key with the most remaining quota", () => {
+    expect(rankOcrSpaceKeyRegions("north", {
+      north: 500,
+      central: 320,
+      isan: 40,
+      south: 120,
+      bangkok: 500
+    })).toEqual(["isan", "south", "central"]);
   });
 });

@@ -30,6 +30,7 @@ type OcrLogRow = {
   ocrspace_found_kplus: number | null;
   ocrspace_found_settlement: number | null;
   ocrspace_detected_amounts: string | null;
+  ocrspace_key_region: Region | null;
   ai_provider: string | null;
   ai_response_excerpt: string | null;
   ai_found_kplus: number | null;
@@ -43,6 +44,8 @@ type OcrLogRow = {
   updated_at: string;
 };
 type DailyUsageRow = { region?: Region; provider: string; request_count: number; success_count: number; error_count: number };
+type OcrSpaceUsageRow = { region: Region; request_count: number };
+type OcrSpaceKeyReservation = { keyRegion: Region; apiKey: string };
 type LineImageSet = { id?: string; index?: number; total?: number };
 type LineEvent = {
   type?: string;
@@ -182,6 +185,59 @@ async function reserveOcrSpaceUsage(env: Env, region: Region) {
   const reserved = await env.DB.prepare("UPDATE daily_usage SET request_count=request_count+1 WHERE usage_date=? AND region=? AND provider='ocrspace' AND request_count<?")
     .bind(today(), region, OCRSPACE_DAILY_LIMIT).run();
   return (reserved.meta.changes ?? 0) === 1;
+}
+export function rankOcrSpaceKeyRegions(
+  preferredRegion: Region,
+  usage: Partial<Record<Region, number>>,
+  availableRegions: Region[] = REGIONS
+) {
+  return [...availableRegions]
+    .filter((region) => (usage[region] ?? 0) < OCRSPACE_DAILY_LIMIT)
+    .sort((left, right) => {
+      if (left === preferredRegion && right !== preferredRegion) return -1;
+      if (right === preferredRegion && left !== preferredRegion) return 1;
+      const usageDifference = (usage[left] ?? 0) - (usage[right] ?? 0);
+      return usageDifference || REGIONS.indexOf(left) - REGIONS.indexOf(right);
+    });
+}
+async function reserveOcrSpaceKey(
+  env: Env,
+  preferredRegion: Region
+): Promise<OcrSpaceKeyReservation | null> {
+  const configured = await env.DB.prepare(`SELECT
+      rc.region,
+      COALESCE(du.request_count,0) AS request_count
+    FROM region_config rc
+    LEFT JOIN daily_usage du
+      ON du.usage_date=?
+      AND du.region=rc.region
+      AND du.provider='ocrspace'
+    WHERE rc.enabled=1 AND rc.ocrspace_api_key IS NOT NULL`)
+    .bind(today())
+    .all<OcrSpaceUsageRow>();
+  const usage = Object.fromEntries(
+    configured.results.map((row) => [row.region, row.request_count])
+  ) as Partial<Record<Region, number>>;
+  const rankedRegions = rankOcrSpaceKeyRegions(
+    preferredRegion,
+    usage,
+    configured.results.map((row) => row.region)
+  );
+
+  for (const keyRegion of rankedRegions) {
+    const row = await env.DB.prepare(
+      "SELECT enabled,ocrspace_api_key FROM region_config WHERE region=?"
+    ).bind(keyRegion).first<Pick<RegionConfigRow, "enabled" | "ocrspace_api_key">>();
+    if (!row?.enabled || !row.ocrspace_api_key) continue;
+    const apiKey = await open(row.ocrspace_api_key, env);
+    if (!apiKey) continue;
+    // The conditional UPDATE in reserveOcrSpaceUsage is the atomic quota claim.
+    // If another queue consumer took the last slot, continue to the next key.
+    if (await reserveOcrSpaceUsage(env, keyRegion)) {
+      return { keyRegion, apiKey };
+    }
+  }
+  return null;
 }
 async function recordOcrSpaceOutcome(env: Env, region: Region, success: boolean) {
   await env.DB.prepare(`UPDATE daily_usage SET
@@ -775,34 +831,46 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
       httpMetadata: { contentType: content.headers.get("content-type") ?? "image/jpeg" }
     });
   }
-  if (!(await reserveOcrSpaceUsage(env, data.region))) {
-    await env.DB.prepare("UPDATE slip_jobs SET status='quota_exhausted',result='needs_fallback',ocr_provider='ocrspace',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-      .bind(`OCR.space ของภูมิภาคนี้ครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน`, row.id).run();
-    await audit(env, "ocr_quota_exhausted", row.job_number, data.region);
+  const ocrReservation = await reserveOcrSpaceKey(env, data.region);
+  if (!ocrReservation) {
+    await env.DB.prepare("UPDATE slip_jobs SET status='quota_exhausted',result='needs_fallback',ocr_provider='ocrspace',ocrspace_key_region=NULL,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(`OCR.space ทุกภูมิภาคที่เปิดใช้งานครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน`, row.id).run();
+    await audit(env, "ocr_pool_quota_exhausted", row.job_number, data.region);
     await deleteCachedImage(env, row);
     return;
+  }
+  const ocrKeyRegion = ocrReservation.keyRegion;
+  if (ocrKeyRegion !== data.region) {
+    await audit(
+      env,
+      "ocr_key_borrowed",
+      `${row.job_number}: ${data.region} -> ${ocrKeyRegion}`,
+      data.region
+    );
   }
   let response: Response;
   try {
     response = await fetch(
       "https://api.ocr.space/parse/image",
-      ocrSpaceRequestInit(imageBytes, c.ocrKey)
+      ocrSpaceRequestInit(imageBytes, ocrReservation.apiKey)
     );
   } catch (error) {
     const errorDetail = error instanceof Error ? error.message : String(error);
-    await recordOcrSpaceOutcome(env, data.region, false);
+    await recordOcrSpaceOutcome(env, ocrKeyRegion, false);
     await audit(env, "ocr_error", errorDetail, data.region);
     if (shouldRetryOcr(attempt)) {
-      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
         .bind(
+          ocrKeyRegion,
           errorDetail.slice(0, 10000),
           `OCR.space ผิดพลาดครั้งที่ ${attempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
           row.id
         ).run();
       throw new Error(`OCR.space retryable fetch error: ${errorDetail}`);
     }
-    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(
+        ocrKeyRegion,
         errorDetail.slice(0, 10000),
         `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
         row.id
@@ -820,21 +888,23 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
   }
   const text = (payload.ParsedResults ?? []).map((v: any) => v.ParsedText ?? "").join("\n");
   const succeeded = response.ok && payloadParsed && !payload.IsErroredOnProcessing;
-  await recordOcrSpaceOutcome(env, data.region, succeeded);
+  await recordOcrSpaceOutcome(env, ocrKeyRegion, succeeded);
   if (!succeeded) {
     const errorDetail = String(payload.ErrorMessage ?? (payloadParsed ? response.status : "invalid JSON response"));
     await audit(env, "ocr_error", errorDetail, data.region);
     if (shouldRetryOcr(attempt)) {
-      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
         .bind(
+          ocrKeyRegion,
           errorDetail.slice(0, 10000),
           `OCR.space ผิดพลาดครั้งที่ ${attempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
           row.id
         ).run();
       throw new Error(`OCR.space retryable error: ${errorDetail}`);
     }
-    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(
+        ocrKeyRegion,
         errorDetail.slice(0, 10000),
         `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
         row.id
@@ -882,6 +952,7 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
       ocrspace_found_kplus=?,
       ocrspace_found_settlement=?,
       ocrspace_detected_amounts=?,
+      ocrspace_key_region=?,
       ai_provider=?,
       ai_response=?,
       ai_found_kplus=?,
@@ -903,6 +974,7 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
       analysis.foundKplus ? 1 : 0,
       analysis.foundSettlement ? 1 : 0,
       JSON.stringify(analysis.detectedAmounts),
+      ocrKeyRegion,
       aiAnalysis ? WORKERS_AI_PROVIDER : null,
       aiAnalysis?.rawText.slice(0, 10000) ?? null,
       aiAnalysis ? (aiAnalysis.foundKplus ? 1 : 0) : null,
@@ -1105,8 +1177,9 @@ export function dashboardHtml() { return `<!doctype html>
         const aiDetail=item.aiResponseExcerpt?'<details class="ocr-detail"><summary>ดูคำตอบ Workers AI Vision</summary><pre class="ocr-text">'+escapeHtml(item.aiResponseExcerpt)+'</pre></details>':'';
         const imageSet=item.imageSetTotal?'<span class="fact">รูปในชุด: '+escapeHtml((item.imageSetIndex??'?')+'/'+item.imageSetTotal)+'</span>':'';
         const ocrAmounts=(item.ocrspaceDetectedAmounts||[]).join(', ')||'ไม่พบ';
+        const ocrKey=item.ocrKeyRegion?'<span class="fact">OCR Key: '+escapeHtml(meta[item.ocrKeyRegion]?.name||item.ocrKeyRegion)+'</span>':'';
         const aiFacts=item.aiProvider?fact('AI KPLUS/K+',item.aiFoundKplus)+fact('AI SETTLEMENT',item.aiFoundSettlement)+'<span class="fact">AI ยอด: '+escapeHtml((item.aiDetectedAmounts||[]).join(', ')||'ไม่พบ')+'</span><span class="fact">AI มั่นใจ: '+(item.aiConfident?'ใช่':'ไม่')+'</span>':'';
-        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(providerName(item.provider))+'</span>'+imageSet+fact('OCR KPLUS/K+',item.ocrspaceFoundKplus)+fact('OCR SETTLEMENT',item.ocrspaceFoundSettlement)+'<span class="fact">OCR ยอด: '+escapeHtml(ocrAmounts)+'</span>'+aiFacts+'<span class="fact">ผลสุดท้าย ยอด: '+escapeHtml(amounts)+'</span></div>'+ocrDetail+aiDetail+'</article>'
+        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(providerName(item.provider))+'</span>'+ocrKey+imageSet+fact('OCR KPLUS/K+',item.ocrspaceFoundKplus)+fact('OCR SETTLEMENT',item.ocrspaceFoundSettlement)+'<span class="fact">OCR ยอด: '+escapeHtml(ocrAmounts)+'</span>'+aiFacts+'<span class="fact">ผลสุดท้าย ยอด: '+escapeHtml(amounts)+'</span></div>'+ocrDetail+aiDetail+'</article>'
       }).join('')
     }
     async function loadLogs(){
@@ -1216,6 +1289,7 @@ async function admin(request: Request, env: Env, url: URL) {
         s.found_kplus,s.found_settlement,s.matched_amount,s.detected_amounts,s.decision_reason,
         substr(s.ocr_text,1,500) AS ocr_excerpt,
         s.ocrspace_found_kplus,s.ocrspace_found_settlement,s.ocrspace_detected_amounts,
+        s.ocrspace_key_region,
         s.ai_provider,substr(s.ai_response,1,500) AS ai_response_excerpt,
         s.ai_found_kplus,s.ai_found_settlement,s.ai_detected_amounts,s.ai_confident,
         s.image_set_id,s.image_set_index,s.image_set_total,s.created_at,s.updated_at
@@ -1241,6 +1315,7 @@ async function admin(request: Request, env: Env, url: URL) {
       ocrspaceFoundKplus: row.ocrspace_found_kplus === null ? (row.ai_provider ? null : row.found_kplus === null ? null : Boolean(row.found_kplus)) : Boolean(row.ocrspace_found_kplus),
       ocrspaceFoundSettlement: row.ocrspace_found_settlement === null ? (row.ai_provider ? null : row.found_settlement === null ? null : Boolean(row.found_settlement)) : Boolean(row.ocrspace_found_settlement),
       ocrspaceDetectedAmounts: decodeAmounts(row.ocrspace_detected_amounts ?? (row.ai_provider ? null : row.detected_amounts)),
+      ocrKeyRegion: row.ocrspace_key_region,
       aiProvider: row.ai_provider,
       aiResponseExcerpt: row.ai_response_excerpt,
       aiFoundKplus: row.ai_found_kplus === null ? null : Boolean(row.ai_found_kplus),
