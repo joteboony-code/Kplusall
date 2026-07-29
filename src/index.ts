@@ -1159,6 +1159,7 @@ export function dashboardHtml() { return `<!doctype html>
     .toggle-row{display:flex;align-items:center;justify-content:space-between;padding:11px 13px;margin-bottom:15px;border-radius:15px;background:#faf8fd}
     .toggle-label strong{display:block;font-size:13px}.toggle-label span{color:var(--muted);font-size:11px}
     .switch{position:relative;width:48px;height:28px;flex:none}.switch input{position:absolute;opacity:0;pointer-events:none}.slider{position:absolute;inset:0;border-radius:999px;background:#d8d1e3;cursor:pointer;transition:.2s}.slider:after{content:"";position:absolute;width:22px;height:22px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 2px 8px rgba(45,39,65,.2);transition:.2s}.switch input:checked+.slider{background:linear-gradient(90deg,var(--pink),var(--purple))}.switch input:checked+.slider:after{transform:translateX(20px)}
+    .webhook-label{display:block;margin:0 2px 6px;font-size:12px;font-weight:700}.webhook-row{display:flex;gap:8px}.webhook-row .webhook-url{min-width:0;color:#655778;background:#faf8fd;font-size:12px}.copy-webhook{flex:none;padding:0 13px;border:1px solid #ddd2f0;border-radius:13px;color:#6d4fa0;background:#f5efff;font-weight:800;cursor:pointer;transition:.18s}.copy-webhook:hover{border-color:#b28af2;background:#eee5ff}.copy-webhook.copied{color:#167b59;border-color:#b9e5d5;background:#eaf8f2}
     .field{display:block;margin-top:11px}.field-label{display:flex;justify-content:space-between;margin:0 2px 6px;font-size:12px;font-weight:700}.field-state{color:var(--muted);font-weight:500}
     input[type=text],input[type=password]{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:13px;outline:0;background:#fff;color:var(--ink);transition:.18s;box-shadow:0 2px 4px rgba(45,39,65,.025)}
     input[type=text]:focus,input[type=password]:focus{border-color:#b28af2;box-shadow:0 0 0 4px rgba(139,92,246,.1)}
@@ -1174,7 +1175,7 @@ export function dashboardHtml() { return `<!doctype html>
     .log-list{display:grid;gap:11px}.log-row{padding:16px;border:1px solid var(--line);border-radius:18px;background:#fff}.log-main{display:grid;grid-template-columns:minmax(105px,.8fr) minmax(115px,.9fr) minmax(100px,.8fr) minmax(0,2.5fr);gap:13px;align-items:center}.log-cell small{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.log-cell strong{display:block;margin-top:2px;font-size:13px;overflow-wrap:anywhere}.status-pill{display:inline-flex!important;width:max-content;padding:5px 9px;border-radius:999px}.status-passed{color:#167b59;background:#e7f7f0}.status-silent{color:#756b85;background:#f1eef5}.status-fallback{color:#a86618;background:#fff2dc}.status-error{color:#ae3c57;background:#ffe8ee}.status-queued{color:#6652a2;background:#eee9ff}
     .log-facts{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}.fact{padding:5px 8px;border-radius:9px;background:#f8f5fb;color:#5f5770;font-size:11px}.fact.yes{color:#167b59;background:#eaf8f2}.fact.no{color:#ad4059;background:#fff0f3}.ocr-detail{margin-top:11px;color:var(--muted);font-size:12px}.ocr-detail summary{cursor:pointer;font-weight:700;color:#6e518e}.ocr-text{margin:8px 0 0;padding:11px;border-radius:11px;background:#f8f6fb;white-space:pre-wrap;overflow-wrap:anywhere}.empty-logs{text-align:center;padding:44px;color:var(--muted)}
     @media(max-width:960px){.ocr-usage-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid,.ocr-usage-grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.log-toolbar{align-items:stretch;flex-direction:column}.log-actions{display:grid;grid-template-columns:1fr 1fr}.refresh-logs,.requeue-stuck{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}.usage-card{min-width:100%}}
+    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid,.ocr-usage-grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.log-toolbar{align-items:stretch;flex-direction:column}.log-actions{display:grid;grid-template-columns:1fr 1fr}.refresh-logs,.requeue-stuck{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}.usage-card{min-width:100%}.webhook-row{align-items:stretch;flex-direction:column}.copy-webhook{min-height:40px}}
   </style>
 </head>
 <body>
@@ -1201,7 +1202,7 @@ export function dashboardHtml() { return `<!doctype html>
   <div class="toast" id="toast"></div>
   <script>
     const regions=['north','isan','south','central','bangkok'];
-    const meta={north:{name:'ภาคเหนือ',code:'NORTH',icon:'⛰️'},isan:{name:'ภาคอีสาน',code:'ISAN',icon:'☀️'},south:{name:'ภาคใต้',code:'SOUTH',icon:'🌊'},central:{name:'พิษณุโลก',code:'PHITSANULOK',icon:'🌾'},bangkok:{name:'โคราช',code:'KORAT',icon:'🏙️'}};
+    const meta={north:{name:'ภาคเหนือ',code:'NORTH',path:'north',icon:'⛰️'},isan:{name:'ภาคอีสาน',code:'ISAN',path:'isan',icon:'☀️'},south:{name:'ภาคใต้',code:'SOUTH',path:'south',icon:'🌊'},central:{name:'พิษณุโลก',code:'PHITSANULOK',path:'phitsanulok',icon:'🌾'},bangkok:{name:'โคราช',code:'KORAT',path:'korat',icon:'🏙️'}};
     const app=document.querySelector('#app');
     const logList=document.querySelector('#log-list');
     const logTabs=document.querySelector('#log-tabs');
@@ -1215,6 +1216,16 @@ export function dashboardHtml() { return `<!doctype html>
     function fact(label,value){const state=value===null?'':(value?' yes':' no');const text=value===null?'—':(value?'พบ':'ไม่พบ');return '<span class="fact'+state+'">'+label+': '+text+'</span>'}
     function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
     function providerName(provider){return provider==='ocrspace'?'OCR.space':provider==='workers_ai_vision'?'Workers AI Vision':provider==='ocrspace+workers_ai_vision'?'OCR.space → Workers AI Vision':provider||'รอระบุ'}
+    function webhookUrl(region){return location.origin+'/webhook/'+meta[region].path}
+    async function copyWebhook(region,button){
+      const value=webhookUrl(region);
+      try{
+        if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(value);
+        else{const input=document.querySelector('#w-'+region);input.focus();input.select();document.execCommand('copy')}
+        button.textContent='คัดลอกแล้ว ✓';button.classList.add('copied');notify('คัดลอก Webhook '+meta[region].name+' แล้ว');
+        setTimeout(()=>{button.textContent='คัดลอก';button.classList.remove('copied')},1800)
+      }catch{notify('คัดลอกไม่สำเร็จ กรุณาเลือก URL แล้วคัดลอกเอง',true)}
+    }
     function renderUsage(items){
       const byProvider=Object.fromEntries(items.map(item=>[item.provider,item]));
       usageSummary.innerHTML=['ocrspace','workers_ai_vision'].map(provider=>{const item=byProvider[provider]||{requestCount:0,successCount:0,errorCount:0};const limit=provider==='ocrspace'?' / 500':'';return '<div class="usage-card"><strong>'+providerName(provider)+' · '+meta[activeLogRegion].name+'</strong><span class="usage-count">'+escapeHtml(item.requestCount)+limit+'</span> ครั้ง · สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</div>'}).join('')
@@ -1245,9 +1256,10 @@ export function dashboardHtml() { return `<!doctype html>
       app.innerHTML=regions.map(region=>{
         const item=data.find(value=>value.region===region)||{enabled:false};
         const complete=Boolean(item.hasLineSecret&&item.hasLineToken&&item.hasOcrKey);
-        return '<article class="region-card"><div class="card-head"><div class="region-title"><div class="region-icon">'+meta[region].icon+'</div><div><div class="region-name">'+meta[region].name+'</div><div class="region-code">'+meta[region].code+'</div></div></div><span class="badge '+(complete?'ready':'incomplete')+'">'+(complete?'พร้อมใช้งาน':'ตั้งค่าไม่ครบ')+'</span></div><div class="toggle-row"><div class="toggle-label"><strong>เปิดใช้งานภูมิภาคนี้</strong><span>รับ Webhook และประมวลผล OCR</span></div><label class="switch"><input type="checkbox" id="e-'+region+'" '+(item.enabled?'checked':'')+'><span class="slider"></span></label></div>'+field(region,'s','LINE Channel Secret','ใส่เมื่อสร้างหรือเปลี่ยน Secret',item.hasLineSecret)+field(region,'t','LINE Channel Access Token','ใส่เมื่อสร้างหรือเปลี่ยน Token',item.hasLineToken)+field(region,'o','OCR.space API Key','ใส่ API Key ของภูมิภาคนี้',item.hasOcrKey)+'<button class="save-region" data-region="'+region+'">บันทึก '+meta[region].name+'</button></article>'
+        return '<article class="region-card"><div class="card-head"><div class="region-title"><div class="region-icon">'+meta[region].icon+'</div><div><div class="region-name">'+meta[region].name+'</div><div class="region-code">'+meta[region].code+'</div></div></div><span class="badge '+(complete?'ready':'incomplete')+'">'+(complete?'พร้อมใช้งาน':'ตั้งค่าไม่ครบ')+'</span></div><div class="toggle-row"><div class="toggle-label"><strong>เปิดใช้งานภูมิภาคนี้</strong><span>รับ Webhook และประมวลผล OCR</span></div><label class="switch"><input type="checkbox" id="e-'+region+'" '+(item.enabled?'checked':'')+'><span class="slider"></span></label></div><label class="webhook-label" for="w-'+region+'">Webhook URL</label><div class="webhook-row"><input class="webhook-url" type="text" id="w-'+region+'" readonly value="'+escapeHtml(webhookUrl(region))+'"><button class="copy-webhook" type="button" data-copy-region="'+region+'">คัดลอก</button></div>'+field(region,'s','LINE Channel Secret','ใส่เมื่อสร้างหรือเปลี่ยน Secret',item.hasLineSecret)+field(region,'t','LINE Channel Access Token','ใส่เมื่อสร้างหรือเปลี่ยน Token',item.hasLineToken)+field(region,'o','OCR.space API Key','ใส่ API Key ของภูมิภาคนี้',item.hasOcrKey)+'<button class="save-region" data-region="'+region+'">บันทึก '+meta[region].name+'</button></article>'
       }).join('');
       document.querySelectorAll('.save-region').forEach(button=>button.addEventListener('click',()=>save(button.dataset.region,button)));
+      document.querySelectorAll('.copy-webhook').forEach(button=>button.addEventListener('click',()=>copyWebhook(button.dataset.copyRegion,button)));
     }
     async function save(region,button){
       button.disabled=true;button.textContent='กำลังบันทึก...';

@@ -17,6 +17,17 @@ describe("control dashboard", () => {
     expect(html).not.toContain("onclick=");
   });
 
+  it("shows copyable webhook URLs for all five public areas", () => {
+    const html = dashboardHtml();
+
+    for (const path of ["north", "isan", "south", "phitsanulok", "korat"]) {
+      expect(html).toContain(`path:'${path}'`);
+    }
+    expect(html).toContain('class="copy-webhook"');
+    expect(html).toContain("navigator.clipboard.writeText");
+    expect(html).toContain("location.origin+'/webhook/'");
+  });
+
   it("renders the five-region summary and responsive themed controls", () => {
     const html = dashboardHtml();
 
