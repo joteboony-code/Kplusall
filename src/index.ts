@@ -334,6 +334,11 @@ export function lineScopeFromEvent(event: LineEvent) {
   };
 }
 
+export function extractJobNumber(text: unknown) {
+  const match = String(text ?? "").match(/(?:^|\D)(\d{8})(?!\d)/);
+  return match?.[1] ?? null;
+}
+
 async function processWebhookEvents(events: LineEvent[], env: Env, region: Region) {
   for (const event of events) {
     if (event.type !== "message") continue;
@@ -341,8 +346,8 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
     if (!scope) continue;
     const userId = scope.senderId;
     if (event.message?.type === "text") {
-      const job = String(event.message.text ?? "").trim();
-      if (!/^\d{8}$/.test(job)) continue;
+      const job = extractJobNumber(event.message.text);
+      if (!job) continue;
       const id = crypto.randomUUID();
       await env.DB.prepare(`INSERT INTO user_jobs(
           id,region,line_user_id,line_sender_id,line_conversation_id,line_source_type,
