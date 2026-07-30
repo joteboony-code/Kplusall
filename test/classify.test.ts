@@ -4,10 +4,14 @@ import {
   analyzeWorkersAiTranscription,
   analyzeWorkersAiVision,
   classify,
+  DEFAULT_PADDLEOCR_MODEL,
+  extractPaddleOcrText,
   imageSetMetadata,
   lineScopeFromEvent,
   mergeOcrAndWorkersAi,
   ocrSpaceRequestInit,
+  paddleOcrPollRequest,
+  paddleOcrSubmitRequest,
   shouldUseWorkersAi,
   VISIBLE_TEXT_PROMPT
 } from "../src/index";
@@ -232,6 +236,50 @@ VOID -THB 1.22`);
     expect(form.get("scale")).toBe("true");
     expect(form.get("isTable")).toBe("true");
     expect(form.get("OCREngine")).toBe("2");
+  });
+
+  it("submits images to PaddleOCR-VL-1.6 without exposing the token in the body", () => {
+    const init = paddleOcrSubmitRequest(
+      Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]).buffer,
+      "paddle-secret"
+    );
+    const headers = new Headers(init.headers);
+    const form = init.body as FormData;
+
+    expect(init.method).toBe("POST");
+    expect(headers.get("authorization")).toBe("Bearer paddle-secret");
+    expect(form.get("model")).toBe(DEFAULT_PADDLEOCR_MODEL);
+    expect(String(form.get("optionalPayload"))).toContain('"useDocOrientationClassify":true');
+    expect(form.get("file")).toBeInstanceOf(Blob);
+    expect(String(form.get("model")) + String(form.get("optionalPayload"))).not.toContain("paddle-secret");
+  });
+
+  it("builds an authenticated PaddleOCR polling request", () => {
+    const init = paddleOcrPollRequest("paddle-secret");
+    expect(init.method).toBe("GET");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer paddle-secret");
+  });
+
+  it("extracts visible text from PaddleOCR-VL JSONL results", () => {
+    const result = extractPaddleOcrText([
+      JSON.stringify({
+        result: {
+          layoutParsingResults: [
+            { markdown: { text: "CHANNEL: KPLUS\nSETTLEMENT" } }
+          ]
+        }
+      }),
+      JSON.stringify({
+        result: {
+          layoutParsingResults: [
+            { markdown: { text: "AMT: THB 1.22" } }
+          ]
+        }
+      })
+    ].join("\n"));
+
+    expect(result).toBe("CHANNEL: KPLUS\nSETTLEMENT\nAMT: THB 1.22");
+    expect(classify(result)).toBe("passed");
   });
 
   it("fails only when Workers AI confidently reads a different amount", () => {

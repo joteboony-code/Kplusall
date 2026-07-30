@@ -2,6 +2,7 @@ type Region = "north" | "central" | "isan" | "south" | "bangkok";
 export type Env = {
   DB: D1Database; SLIPS: R2Bucket; OCR_JOBS: Queue; AI: Ai;
   ADMIN_PASSWORD?: string; CONFIG_ENCRYPTION_KEY?: string;
+  PADDLEOCR_TOKEN?: string; PADDLEOCR_MODEL?: string;
 };
 type RegionConfigRow = { region: Region; enabled: number; line_channel_secret: ArrayBuffer | null; line_channel_token: ArrayBuffer | null; ocrspace_api_key: ArrayBuffer | null };
 type RegionConfig = { region: Region; enabled: boolean; lineSecret: string; lineToken: string; ocrKey: string };
@@ -48,6 +49,15 @@ type OcrLogRow = {
 type DailyUsageRow = { region?: Region; provider: string; request_count: number; success_count: number; error_count: number };
 type OcrSpaceUsageRow = { region: Region; request_count: number };
 type OcrSpaceKeyReservation = { keyRegion: Region; apiKey: string };
+type OcrQueueMessage = {
+  id: string;
+  region: Region;
+  phase?: "start" | "paddle_poll" | "ocrspace";
+  paddleJobId?: string;
+  paddlePollCount?: number;
+  ocrSpaceAttempt?: number;
+  paddleAttempted?: boolean;
+};
 type LatestReplyTokenRow = {
   id: string;
   line_reply_token: string;
@@ -79,6 +89,8 @@ type SlipProcessRow = {
   detected_amounts: string | null;
   decision_reason: string | null;
   result_sent_at: string | null;
+  paddle_job_id?: string | null;
+  paddle_poll_count?: number;
 };
 const REGIONS: Region[] = ["north", "isan", "south", "central", "bangkok"];
 const WEBHOOK_REGION_ALIASES: Record<string, Region> = {
@@ -96,6 +108,11 @@ export const MAX_OCR_ATTEMPTS = 2;
 const R2_FALLBACK_RETENTION_MS = 24 * 60 * 60 * 1000;
 const WORKERS_AI_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
 const WORKERS_AI_PROVIDER = "workers_ai_vision";
+const PADDLEOCR_PROVIDER = "paddleocr";
+const PADDLEOCR_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
+export const DEFAULT_PADDLEOCR_MODEL = "PaddleOCR-VL-1.6";
+export const PADDLEOCR_POLL_DELAY_SECONDS = 3;
+export const MAX_PADDLEOCR_POLLS = 6;
 export const VISIBLE_TEXT_PROMPT = `Transcribe only text that is clearly visible in this image.
 Preserve line breaks, decimal points, and minus signs exactly as printed.
 Do not describe the image, infer hidden text, correct values, or add commentary.
@@ -157,6 +174,64 @@ export function ocrSpaceRequestInit(imageBytes: ArrayBuffer, apiKey: string): Re
     body: form,
     signal: AbortSignal.timeout(30_000)
   };
+}
+
+export function paddleOcrSubmitRequest(
+  imageBytes: ArrayBuffer,
+  token: string,
+  model = DEFAULT_PADDLEOCR_MODEL
+): RequestInit {
+  const bytes = new Uint8Array(imageBytes);
+  const form = new FormData();
+  form.set("model", model);
+  form.set("optionalPayload", JSON.stringify({
+    useDocOrientationClassify: true,
+    useDocUnwarping: false,
+    useChartRecognition: false
+  }));
+  form.set("file", new Blob([imageBytes], { type: imageMime(bytes) }), "slip");
+  return {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+    body: form,
+    signal: AbortSignal.timeout(30_000)
+  };
+}
+
+export function paddleOcrPollRequest(token: string): RequestInit {
+  return {
+    method: "GET",
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(15_000)
+  };
+}
+
+export function extractPaddleOcrText(jsonl: string) {
+  const text: string[] = [];
+  for (const line of jsonl.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let value: any;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const result = value?.result ?? value;
+    for (const item of result?.layoutParsingResults ?? []) {
+      const markdown = item?.markdown?.text;
+      if (typeof markdown === "string" && markdown.trim()) text.push(markdown);
+    }
+    for (const item of result?.ocrResults ?? []) {
+      const pruned = item?.prunedResult;
+      if (typeof pruned === "string" && pruned.trim()) {
+        text.push(pruned);
+      } else if (pruned && typeof pruned === "object") {
+        const recTexts = pruned.rec_texts ?? pruned.recTexts;
+        if (Array.isArray(recTexts)) text.push(recTexts.map(String).join("\n"));
+      }
+    }
+  }
+  return text.join("\n").trim();
 }
 
 async function hmac(text: string, key: string) {
@@ -263,6 +338,19 @@ async function recordOcrSpaceOutcome(env: Env, region: Region, success: boolean)
       error_count=error_count+?
     WHERE usage_date=? AND region=? AND provider='ocrspace'`)
     .bind(success ? 1 : 0, success ? 0 : 1, today(), region).run();
+}
+async function beginPaddleOcrUsage(env: Env, region: Region) {
+  await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,?)")
+    .bind(today(), region, PADDLEOCR_PROVIDER).run();
+  await env.DB.prepare("UPDATE daily_usage SET request_count=request_count+1 WHERE usage_date=? AND region=? AND provider=?")
+    .bind(today(), region, PADDLEOCR_PROVIDER).run();
+}
+async function recordPaddleOcrOutcome(env: Env, region: Region, success: boolean) {
+  await env.DB.prepare(`UPDATE daily_usage SET
+      success_count=success_count+?,
+      error_count=error_count+?
+    WHERE usage_date=? AND region=? AND provider=?`)
+    .bind(success ? 1 : 0, success ? 0 : 1, today(), region, PADDLEOCR_PROVIDER).run();
 }
 async function beginWorkersAiUsage(env: Env, region: Region) {
   await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,?)")
@@ -468,7 +556,7 @@ async function recordWebhookFailure(env: Env, region: Region, error: unknown) {
 async function webhook(request: Request, env: Env, region: Region) {
   let c: RegionConfig;
   try { c = await config(env, region); } catch { return json({ error: "control secrets not initialized" }, 503); }
-  if (!c.enabled || !c.lineSecret || !c.lineToken || !c.ocrKey) return json({ error: "region is not configured" }, 503);
+  if (!c.enabled || !c.lineSecret || !c.lineToken) return json({ error: "region is not configured" }, 503);
   const raw = await request.text();
   if (!(await validSignature(raw, request.headers.get("x-line-signature"), c.lineSecret))) {
     await audit(env, "signature_invalid", "LINE signature rejected", region);
@@ -710,7 +798,11 @@ export function analyzeWorkersAiTranscription(response: unknown): WorkersAiVisio
   };
 }
 
-export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalysis): OcrAnalysis {
+export function mergeOcrAndWorkersAi(
+  ocr: OcrAnalysis,
+  ai: WorkersAiVisionAnalysis,
+  ocrLabel = "OCR.space"
+): OcrAnalysis {
   const aiCanConfirm = ai.confident;
   const foundKplus = ocr.foundKplus || (aiCanConfirm && ai.foundKplus);
   const foundSettlement = ocr.foundSettlement || (aiCanConfirm && ai.foundSettlement);
@@ -749,7 +841,7 @@ export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalys
       foundSettlement,
       matchedAmount,
       detectedAmounts,
-      reason: `OCR.space และ Workers AI Vision ยืนยันร่วมกัน: พบ KPLUS, SETTLEMENT และยอด ${matchedAmount}`
+      reason: `${ocrLabel} และ Workers AI Vision ยืนยันร่วมกัน: พบ KPLUS, SETTLEMENT และยอด ${matchedAmount}`
     };
   }
   if (foundKplus && foundSettlement && confirmedWrongAmount !== undefined) {
@@ -759,7 +851,7 @@ export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalys
       foundSettlement,
       matchedAmount,
       detectedAmounts,
-      reason: `OCR.space และ Workers AI Vision ยืนยันยอดอื่นตรงกัน: ${confirmedWrongAmount} บาท`
+      reason: `${ocrLabel} และ Workers AI Vision ยืนยันยอดอื่นตรงกัน: ${confirmedWrongAmount} บาท`
     };
   }
   return {
@@ -768,7 +860,7 @@ export function mergeOcrAndWorkersAi(ocr: OcrAnalysis, ai: WorkersAiVisionAnalys
     foundSettlement,
     matchedAmount,
     detectedAmounts,
-    reason: "OCR.space และ Workers AI Vision ยังพบหลักฐานไม่ครบ จึงยังไม่แจ้งผล"
+    reason: `${ocrLabel} และ Workers AI Vision ยังพบหลักฐานไม่ครบ จึงยังไม่แจ้งผล`
   };
 }
 
@@ -798,7 +890,9 @@ async function completeImageAnalysis(
   ocrText: string,
   analysis: OcrAnalysis,
   ocrKeyRegion: Region | null,
-  ocrUnavailable = false
+  ocrUnavailable = false,
+  primaryProvider = "ocrspace",
+  ocrLabel = "OCR.space"
 ) {
   let finalAnalysis = analysis;
   let aiAnalysis: WorkersAiVisionAnalysis | null = null;
@@ -807,7 +901,7 @@ async function completeImageAnalysis(
     try {
       aiAnalysis = await runWorkersAiVision(env, imageBytes);
       await recordWorkersAiOutcome(env, row.region, true);
-      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
+      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis, ocrLabel);
       await audit(env, `workers_ai_${finalAnalysis.result}`, row.job_number, row.region);
     } catch (error) {
       await recordWorkersAiOutcome(env, row.region, false);
@@ -822,13 +916,13 @@ async function completeImageAnalysis(
         rawText: detail,
         reason: `Workers AI Vision ผิดพลาด: ${detail}`.slice(0, 1000)
       };
-      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis);
+      finalAnalysis = mergeOcrAndWorkersAi(analysis, aiAnalysis, ocrLabel);
       await audit(env, "workers_ai_error", detail, row.region);
     }
   }
   const provider = aiAnalysis
-    ? (ocrUnavailable ? WORKERS_AI_PROVIDER : `ocrspace+${WORKERS_AI_PROVIDER}`)
-    : "ocrspace";
+    ? `${primaryProvider}+${WORKERS_AI_PROVIDER}`
+    : primaryProvider;
   await env.DB.prepare(`UPDATE slip_jobs SET
       status=?,
       ocr_provider=?,
@@ -992,88 +1086,83 @@ async function rejectOversizedImage(env: Env, row: SlipProcessRow, size: number)
   await deleteCachedImage(env, row);
 }
 
-async function processJob(env: Env, data: { id: string; region: Region }, attempt = 1) {
-  const row = await env.DB.prepare("SELECT s.*,u.job_number,u.line_source_type,u.result_sent_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?")
-    .bind(data.id, data.region).first<SlipProcessRow>();
-  if (!row) return;
-  const c = await config(env, data.region);
-  if (!c.enabled || !c.lineToken) throw new Error("region configuration unavailable");
-  if ((row.status === "passed" || row.status === "failed") && !row.result_sent_at) {
-    await deleteCachedImage(env, row);
-    await deliverResult(env, row, c.lineToken, row.status);
-    return;
-  }
-  if (row.status !== "queued") {
-    await deleteCachedImage(env, row);
-    return;
-  }
-  if (row.result_sent_at) {
-    await env.DB.prepare("UPDATE slip_jobs SET status='suppressed',result='silent',decision_reason='งานนี้แจ้งผลตรวจไปแล้ว จึงไม่ตรวจซ้ำ',updated_at=CURRENT_TIMESTAMP WHERE id=?")
-      .bind(row.id).run();
-    await audit(env, "ocr_suppressed_after_result", row.job_number, data.region);
-    await deleteCachedImage(env, row);
-    return;
-  }
-  let imageBytes: ArrayBuffer;
+async function loadImageBytes(
+  env: Env,
+  row: SlipProcessRow,
+  lineToken: string,
+  attempt: number
+) {
   const object = await env.SLIPS.get(row.r2_key);
   if (object && "body" in object && object.body) {
     if (imageTooLarge(object.size)) {
       await rejectOversizedImage(env, row, object.size);
-      return;
+      return null;
     }
-    imageBytes = await new Response(object.body).arrayBuffer();
-  } else {
-    const content = await fetch(`https://api-data.line.me/v2/bot/message/${row.line_message_id}/content`, {
-      headers: { authorization: `Bearer ${c.lineToken}` }
-    });
-    if (!content.ok) {
-      await audit(env, "line_image_download_failed", `${row.job_number}: HTTP ${content.status}`, data.region);
-      if (shouldRetryOcr(attempt)) throw new Error(`LINE image download failed: HTTP ${content.status}`);
-      await env.DB.prepare("UPDATE slip_jobs SET status='download_error',result='needs_fallback',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-        .bind(`โหลดรูปจาก LINE ไม่สำเร็จหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: HTTP ${content.status}`, row.id).run();
-      await deleteCachedImage(env, row);
-      return;
-    }
-    const declaredSize = Number(content.headers.get("content-length"));
-    if (content.headers.has("content-length") && imageTooLarge(declaredSize)) {
-      await content.body?.cancel();
-      await rejectOversizedImage(env, row, declaredSize);
-      return;
-    }
-    imageBytes = await content.arrayBuffer();
-    if (imageTooLarge(imageBytes.byteLength)) {
-      await rejectOversizedImage(env, row, imageBytes.byteLength);
-      return;
-    }
-    await env.SLIPS.put(row.r2_key, imageBytes, {
-      httpMetadata: { contentType: content.headers.get("content-type") ?? "image/jpeg" }
-    });
+    return new Response(object.body).arrayBuffer();
   }
-  const ocrReservation = await reserveOcrSpaceKey(env, data.region);
+  const content = await fetch(`https://api-data.line.me/v2/bot/message/${row.line_message_id}/content`, {
+    headers: { authorization: `Bearer ${lineToken}` }
+  });
+  if (!content.ok) {
+    await audit(env, "line_image_download_failed", `${row.job_number}: HTTP ${content.status}`, row.region);
+    if (shouldRetryOcr(attempt)) throw new Error(`LINE image download failed: HTTP ${content.status}`);
+    await env.DB.prepare("UPDATE slip_jobs SET status='download_error',result='needs_fallback',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(`โหลดรูปจาก LINE ไม่สำเร็จหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: HTTP ${content.status}`, row.id).run();
+    await deleteCachedImage(env, row);
+    return null;
+  }
+  const declaredSize = Number(content.headers.get("content-length"));
+  if (content.headers.has("content-length") && imageTooLarge(declaredSize)) {
+    await content.body?.cancel();
+    await rejectOversizedImage(env, row, declaredSize);
+    return null;
+  }
+  const imageBytes = await content.arrayBuffer();
+  if (imageTooLarge(imageBytes.byteLength)) {
+    await rejectOversizedImage(env, row, imageBytes.byteLength);
+    return null;
+  }
+  await env.SLIPS.put(row.r2_key, imageBytes, {
+    httpMetadata: { contentType: content.headers.get("content-type") ?? "image/jpeg" }
+  });
+  return imageBytes;
+}
+
+async function runOcrSpaceFallback(
+  env: Env,
+  row: SlipProcessRow,
+  lineToken: string,
+  imageBytes: ArrayBuffer,
+  ocrAttempt: number,
+  paddleAttempted: boolean
+) {
+  const providerChain = paddleAttempted ? "paddleocr+ocrspace" : "ocrspace";
+  const ocrReservation = await reserveOcrSpaceKey(env, row.region);
   if (!ocrReservation) {
-    await audit(env, "ocr_pool_quota_exhausted", row.job_number, data.region);
+    await audit(env, "ocr_pool_quota_exhausted", row.job_number, row.region);
     const unavailable = unavailableOcrAnalysis(
       `OCR.space ทุกภูมิภาคที่เปิดใช้งานครบ ${OCRSPACE_DAILY_LIMIT} รูปต่อวัน จึงส่งต่อ Workers AI`
     );
     await completeImageAnalysis(
       env,
       row,
-      c.lineToken,
+      lineToken,
       imageBytes,
       "",
       unavailable,
       null,
-      true
+      true,
+      providerChain
     );
     return;
   }
   const ocrKeyRegion = ocrReservation.keyRegion;
-  if (ocrKeyRegion !== data.region) {
+  if (ocrKeyRegion !== row.region) {
     await audit(
       env,
       "ocr_key_borrowed",
-      `${row.job_number}: ${data.region} -> ${ocrKeyRegion}`,
-      data.region
+      `${row.job_number}: ${row.region} -> ${ocrKeyRegion}`,
+      row.region
     );
   }
   let response: Response;
@@ -1085,19 +1174,28 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
   } catch (error) {
     const errorDetail = error instanceof Error ? error.message : String(error);
     await recordOcrSpaceOutcome(env, ocrKeyRegion, false);
-    await audit(env, "ocr_error", errorDetail, data.region);
-    if (shouldRetryOcr(attempt)) {
-      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    await audit(env, "ocr_error", errorDetail, row.region);
+    if (shouldRetryOcr(ocrAttempt)) {
+      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider=?,ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
         .bind(
+          providerChain,
           ocrKeyRegion,
           errorDetail.slice(0, 10000),
-          `OCR.space ผิดพลาดครั้งที่ ${attempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
+          `OCR.space ผิดพลาดครั้งที่ ${ocrAttempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
           row.id
         ).run();
-      throw new Error(`OCR.space retryable fetch error: ${errorDetail}`);
+      await env.OCR_JOBS.send({
+        id: row.id,
+        region: row.region,
+        phase: "ocrspace",
+        ocrSpaceAttempt: ocrAttempt + 1,
+        paddleAttempted
+      } satisfies OcrQueueMessage, { delaySeconds: 2 });
+      return;
     }
-    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider=?,ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(
+        providerChain,
         ocrKeyRegion,
         errorDetail.slice(0, 10000),
         `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
@@ -1109,12 +1207,13 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
     await completeImageAnalysis(
       env,
       row,
-      c.lineToken,
+      lineToken,
       imageBytes,
       errorDetail,
       unavailable,
       ocrKeyRegion,
-      true
+      true,
+      providerChain
     );
     return;
   }
@@ -1131,19 +1230,28 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
   await recordOcrSpaceOutcome(env, ocrKeyRegion, succeeded);
   if (!succeeded) {
     const errorDetail = String(payload.ErrorMessage ?? (payloadParsed ? response.status : "invalid JSON response"));
-    await audit(env, "ocr_error", errorDetail, data.region);
-    if (shouldRetryOcr(attempt)) {
-      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    await audit(env, "ocr_error", errorDetail, row.region);
+    if (shouldRetryOcr(ocrAttempt)) {
+      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider=?,ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
         .bind(
+          providerChain,
           ocrKeyRegion,
           errorDetail.slice(0, 10000),
-          `OCR.space ผิดพลาดครั้งที่ ${attempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
+          `OCR.space ผิดพลาดครั้งที่ ${ocrAttempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
           row.id
         ).run();
-      throw new Error(`OCR.space retryable error: ${errorDetail}`);
+      await env.OCR_JOBS.send({
+        id: row.id,
+        region: row.region,
+        phase: "ocrspace",
+        ocrSpaceAttempt: ocrAttempt + 1,
+        paddleAttempted
+      } satisfies OcrQueueMessage, { delaySeconds: 2 });
+      return;
     }
-    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider='ocrspace',ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider=?,ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(
+        providerChain,
         ocrKeyRegion,
         errorDetail.slice(0, 10000),
         `OCR.space ผิดพลาดหลังลอง ${MAX_OCR_ATTEMPTS} ครั้ง: ${errorDetail}`.slice(0, 1000),
@@ -1155,12 +1263,13 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
     await completeImageAnalysis(
       env,
       row,
-      c.lineToken,
+      lineToken,
       imageBytes,
       errorDetail,
       unavailable,
       ocrKeyRegion,
-      true
+      true,
+      providerChain
     );
     return;
   }
@@ -1168,12 +1277,168 @@ async function processJob(env: Env, data: { id: string; region: Region }, attemp
   await completeImageAnalysis(
     env,
     row,
-    c.lineToken,
+    lineToken,
     imageBytes,
     text,
     analysis,
-    ocrKeyRegion
+    ocrKeyRegion,
+    false,
+    providerChain
   );
+}
+
+async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
+  const row = await env.DB.prepare("SELECT s.*,u.job_number,u.line_source_type,u.result_sent_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?")
+    .bind(data.id, data.region).first<SlipProcessRow>();
+  if (!row) return;
+  const c = await config(env, data.region);
+  if (!c.enabled || !c.lineToken) throw new Error("region configuration unavailable");
+  if ((row.status === "passed" || row.status === "failed") && !row.result_sent_at) {
+    await deleteCachedImage(env, row);
+    await deliverResult(env, row, c.lineToken, row.status);
+    return;
+  }
+  if (row.status !== "queued" && row.status !== "paddle_pending") {
+    await deleteCachedImage(env, row);
+    return;
+  }
+  if (row.result_sent_at) {
+    await env.DB.prepare("UPDATE slip_jobs SET status='suppressed',result='silent',decision_reason='งานนี้แจ้งผลตรวจไปแล้ว จึงไม่ตรวจซ้ำ',updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(row.id).run();
+    await audit(env, "ocr_suppressed_after_result", row.job_number, data.region);
+    await deleteCachedImage(env, row);
+    return;
+  }
+  const imageBytes = await loadImageBytes(env, row, c.lineToken, attempt);
+  if (!imageBytes) return;
+
+  const phase = data.phase ?? (row.status === "paddle_pending" ? "paddle_poll" : "start");
+  if (phase === "ocrspace") {
+    await runOcrSpaceFallback(
+      env,
+      row,
+      c.lineToken,
+      imageBytes,
+      data.ocrSpaceAttempt ?? 1,
+      Boolean(data.paddleAttempted)
+    );
+    return;
+  }
+
+  const paddleToken = env.PADDLEOCR_TOKEN?.trim();
+  if (!paddleToken) {
+    await audit(env, "paddleocr_not_configured", `${row.job_number}: ใช้ OCR.space`, row.region);
+    await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, false);
+    return;
+  }
+
+  if (phase === "start") {
+    await beginPaddleOcrUsage(env, row.region);
+    try {
+      const response = await fetch(
+        PADDLEOCR_JOB_URL,
+        paddleOcrSubmitRequest(imageBytes, paddleToken, env.PADDLEOCR_MODEL?.trim() || DEFAULT_PADDLEOCR_MODEL)
+      );
+      const payload = await response.json<any>().catch(() => null);
+      const jobId = payload?.data?.jobId;
+      if (!response.ok || payload?.code !== 0 || typeof jobId !== "string" || !jobId) {
+        throw new Error(String(payload?.msg ?? `HTTP ${response.status}`));
+      }
+      await env.DB.prepare(`UPDATE slip_jobs SET
+          status='paddle_pending',
+          ocr_provider=?,
+          paddle_job_id=?,
+          paddle_poll_count=0,
+          decision_reason='ส่งรูปให้ PaddleOCR แล้ว กำลังรอผล',
+          updated_at=CURRENT_TIMESTAMP
+        WHERE id=?`)
+        .bind(PADDLEOCR_PROVIDER, jobId, row.id).run();
+      await env.OCR_JOBS.send({
+        id: row.id,
+        region: row.region,
+        phase: "paddle_poll",
+        paddleJobId: jobId,
+        paddlePollCount: 0,
+        paddleAttempted: true
+      } satisfies OcrQueueMessage, { delaySeconds: PADDLEOCR_POLL_DELAY_SECONDS });
+      await audit(env, "paddleocr_submitted", `${row.job_number}: ${jobId}`, row.region);
+      return;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      await recordPaddleOcrOutcome(env, row.region, false);
+      await audit(env, "paddleocr_submit_error", detail, row.region);
+      await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='paddleocr',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .bind(`PaddleOCR ส่งงานไม่สำเร็จ จึงใช้ OCR.space: ${detail}`.slice(0, 1000), row.id).run();
+      await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, true);
+      return;
+    }
+  }
+
+  const jobId = data.paddleJobId ?? row.paddle_job_id;
+  if (!jobId) {
+    await recordPaddleOcrOutcome(env, row.region, false);
+    await audit(env, "paddleocr_job_missing", row.job_number, row.region);
+    await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, true);
+    return;
+  }
+  try {
+    const response = await fetch(`${PADDLEOCR_JOB_URL}/${encodeURIComponent(jobId)}`, paddleOcrPollRequest(paddleToken));
+    const payload = await response.json<any>().catch(() => null);
+    if (!response.ok || payload?.code !== 0) {
+      throw new Error(String(payload?.msg ?? `HTTP ${response.status}`));
+    }
+    const state = payload?.data?.state;
+    if (state === "pending" || state === "running") {
+      const pollCount = (data.paddlePollCount ?? row.paddle_poll_count ?? 0) + 1;
+      if (pollCount >= MAX_PADDLEOCR_POLLS) {
+        throw new Error(`หมดเวลารอผลหลังตรวจสถานะ ${pollCount} ครั้ง`);
+      }
+      await env.DB.prepare("UPDATE slip_jobs SET paddle_poll_count=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .bind(pollCount, `PaddleOCR กำลังประมวลผล (${pollCount}/${MAX_PADDLEOCR_POLLS})`, row.id).run();
+      await env.OCR_JOBS.send({
+        id: row.id,
+        region: row.region,
+        phase: "paddle_poll",
+        paddleJobId: jobId,
+        paddlePollCount: pollCount,
+        paddleAttempted: true
+      } satisfies OcrQueueMessage, { delaySeconds: PADDLEOCR_POLL_DELAY_SECONDS });
+      return;
+    }
+    if (state === "failed") {
+      throw new Error(String(payload?.data?.errorMsg ?? "PaddleOCR parsing failed"));
+    }
+    if (state !== "done") {
+      throw new Error(`สถานะ PaddleOCR ไม่รู้จัก: ${String(state)}`);
+    }
+    const jsonUrl = payload?.data?.resultUrl?.jsonUrl;
+    if (typeof jsonUrl !== "string" || !jsonUrl) throw new Error("PaddleOCR ไม่ส่ง result URL");
+    const resultResponse = await fetch(jsonUrl, { signal: AbortSignal.timeout(20_000) });
+    if (!resultResponse.ok) throw new Error(`ดาวน์โหลดผล PaddleOCR ไม่สำเร็จ: HTTP ${resultResponse.status}`);
+    const text = extractPaddleOcrText(await resultResponse.text());
+    if (!text) throw new Error("PaddleOCR ส่งผลลัพธ์ที่ไม่มีข้อความ");
+    await recordPaddleOcrOutcome(env, row.region, true);
+    await audit(env, "paddleocr_done", `${row.job_number}: ${jobId}`, row.region);
+    await completeImageAnalysis(
+      env,
+      row,
+      c.lineToken,
+      imageBytes,
+      text,
+      analyzeOcr(text, true),
+      null,
+      false,
+      PADDLEOCR_PROVIDER,
+      "PaddleOCR"
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    await recordPaddleOcrOutcome(env, row.region, false);
+    await audit(env, "paddleocr_error", `${jobId}: ${detail}`, row.region);
+    await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='paddleocr',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(`PaddleOCR ไม่สำเร็จ จึงใช้ OCR.space: ${detail}`.slice(0, 1000), row.id).run();
+    await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, true);
+  }
 }
 
 function decodeAmounts(value: string | null) {
@@ -1278,7 +1543,7 @@ export function dashboardHtml() { return `<!doctype html>
 <body>
   <main class="shell">
     <section class="hero">
-      <div class="brand"><div class="brand-icon">✦</div><div><h1>Kplusall <span class="gradient-text">Control</span></h1><p class="subtitle">ศูนย์จัดการ LINE OA, OCR.space และ Workers AI สำหรับทั้ง 5 ภูมิภาค</p></div></div>
+      <div class="brand"><div class="brand-icon">✦</div><div><h1>Kplusall <span class="gradient-text">Control</span></h1><p class="subtitle">ศูนย์จัดการ LINE OA, PaddleOCR, OCR.space และ Workers AI สำหรับทั้ง 5 ภูมิภาค</p></div></div>
       <div class="summary">
         <div class="summary-item"><span class="summary-value">5</span><span class="summary-label">ภูมิภาคทั้งหมด</span></div>
         <div class="summary-item"><span class="summary-value" id="active-count">—</span><span class="summary-label">กำลังเปิดใช้งาน</span></div>
@@ -1287,7 +1552,7 @@ export function dashboardHtml() { return `<!doctype html>
     </section>
     <div class="section-head"><div><h2>ตั้งค่าระบบแต่ละภูมิภาค</h2><p>กรอกเฉพาะค่าที่ต้องการเปลี่ยน ค่าเดิมจะไม่ถูกแสดงกลับมา</p></div><div class="secure-note">🔒 Secret เข้ารหัสแล้ว</div></div>
     <section class="grid" id="app"><div class="loading"><span class="spinner"></span><br>กำลังโหลดข้อมูล...</div></section>
-    <div class="section-head"><div><h2>การใช้งาน OCR วันนี้</h2><p>ตัวนับแยก OCR.space และ Workers AI ของแต่ละภูมิภาค</p></div><div class="secure-note">OCR.space ไม่เกิน 500 ครั้งต่อภาค/วัน</div></div>
+    <div class="section-head"><div><h2>การใช้งาน OCR วันนี้</h2><p>ตัวนับแยก PaddleOCR, OCR.space และ Workers AI ของแต่ละภูมิภาค</p></div><div class="secure-note">PaddleOCR เป็นตัวหลัก · OCR.space เป็นระบบสำรอง</div></div>
     <section class="ocr-usage-grid" id="ocr-usage-grid"><div class="loading"><span class="spinner"></span><br>กำลังโหลดตัวนับ...</div></section>
     <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">กดรีเฟรชเมื่อต้องการข้อมูลล่าสุด</div></div>
     <section class="log-panel">
@@ -1309,10 +1574,10 @@ export function dashboardHtml() { return `<!doctype html>
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
     function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
     function formatTime(value){if(!value)return '—';const date=new Date(String(value).replace(' ','T')+'Z');return Number.isNaN(date.getTime())?value:date.toLocaleString('th-TH',{dateStyle:'short',timeStyle:'short'})}
-    function statusInfo(item){const key=['quota_exhausted','image_too_large','download_error','ocr_error'].includes(item.status)?item.status:(item.result||item.status);return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],silent:['เงียบ','status-silent'],needs_fallback:['รอตรวจสำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],image_too_large:['รูปใหญ่เกินกำหนด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
+    function statusInfo(item){const key=['quota_exhausted','image_too_large','download_error','ocr_error'].includes(item.status)?item.status:(item.result||item.status);return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],silent:['เงียบ','status-silent'],needs_fallback:['รอตรวจสำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],image_too_large:['รูปใหญ่เกินกำหนด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued'],paddle_pending:['PaddleOCR กำลังตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
     function fact(label,value){const state=value===null?'':(value?' yes':' no');const text=value===null?'—':(value?'พบ':'ไม่พบ');return '<span class="fact'+state+'">'+label+': '+text+'</span>'}
     function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
-    function providerName(provider){return provider==='ocrspace'?'OCR.space':provider==='workers_ai_vision'?'Workers AI Vision':provider==='ocrspace+workers_ai_vision'?'OCR.space → Workers AI Vision':provider||'รอระบุ'}
+    function providerName(provider){if(!provider)return 'รอระบุ';const names={paddleocr:'PaddleOCR',ocrspace:'OCR.space',workers_ai_vision:'Workers AI Vision'};return provider.split('+').map(part=>names[part]||part).join(' → ')}
     function webhookUrl(region){return location.origin+'/webhook/'+meta[region].path}
     async function copyWebhook(region,button){
       const value=webhookUrl(region);
@@ -1325,15 +1590,16 @@ export function dashboardHtml() { return `<!doctype html>
     }
     function renderUsage(items){
       const byProvider=Object.fromEntries(items.map(item=>[item.provider,item]));
-      usageSummary.innerHTML=['ocrspace','workers_ai_vision'].map(provider=>{const item=byProvider[provider]||{requestCount:0,successCount:0,errorCount:0};const limit=provider==='ocrspace'?' / 500':'';return '<div class="usage-card"><strong>'+providerName(provider)+' · '+meta[activeLogRegion].name+'</strong><span class="usage-count">'+escapeHtml(item.requestCount)+limit+'</span> ครั้ง · สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</div>'}).join('')
+      usageSummary.innerHTML=['paddleocr','ocrspace','workers_ai_vision'].map(provider=>{const item=byProvider[provider]||{requestCount:0,successCount:0,errorCount:0};const limit=provider==='ocrspace'?' / 500':'';return '<div class="usage-card"><strong>'+providerName(provider)+' · '+meta[activeLogRegion].name+'</strong><span class="usage-count">'+escapeHtml(item.requestCount)+limit+'</span> ครั้ง · สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</div>'}).join('')
     }
     function renderAllUsage(items){
       const keyed=Object.fromEntries(items.map(item=>[item.region+':'+item.provider,item]));
       ocrUsageGrid.innerHTML=regions.map(region=>{
+        const paddle=keyed[region+':paddleocr']||{requestCount:0,successCount:0,errorCount:0};
         const ocr=keyed[region+':ocrspace']||{requestCount:0,successCount:0,errorCount:0};
         const ai=keyed[region+':workers_ai_vision']||{requestCount:0,successCount:0,errorCount:0};
         const provider=(label,item,suffix='')=>'<div class="ocr-provider-count"><span>'+label+'</span><em>สำเร็จ '+escapeHtml(item.successCount)+' · ผิดพลาด '+escapeHtml(item.errorCount)+'</em><strong>'+escapeHtml(item.requestCount)+suffix+'</strong></div>';
-        return '<article class="ocr-usage-region"><h3>'+meta[region].icon+' '+meta[region].name+'</h3>'+provider('OCR.space',ocr,'/500')+provider('Workers AI Vision',ai)+'</article>'
+        return '<article class="ocr-usage-region"><h3>'+meta[region].icon+' '+meta[region].name+'</h3>'+provider('PaddleOCR',paddle)+provider('OCR.space',ocr,'/500')+provider('Workers AI Vision',ai)+'</article>'
       }).join('')
     }
     async function loadAllUsage(){
@@ -1347,12 +1613,12 @@ export function dashboardHtml() { return `<!doctype html>
       if(!response.ok){location='/admin';return}
       const data=await response.json();
       const active=data.filter(item=>item.enabled).length;
-      const ready=data.filter(item=>item.hasLineSecret&&item.hasLineToken&&item.hasOcrKey).length;
+      const ready=data.filter(item=>item.hasLineSecret&&item.hasLineToken&&(item.hasPaddleToken||item.hasOcrKey)).length;
       document.querySelector('#active-count').textContent=String(active);
       document.querySelector('#ready-count').textContent=String(ready);
       app.innerHTML=regions.map(region=>{
         const item=data.find(value=>value.region===region)||{enabled:false};
-        const complete=Boolean(item.hasLineSecret&&item.hasLineToken&&item.hasOcrKey);
+        const complete=Boolean(item.hasLineSecret&&item.hasLineToken&&(item.hasPaddleToken||item.hasOcrKey));
         return '<article class="region-card"><div class="card-head"><div class="region-title"><div class="region-icon">'+meta[region].icon+'</div><div><div class="region-name">'+meta[region].name+'</div><div class="region-code">'+meta[region].code+'</div></div></div><span class="badge '+(complete?'ready':'incomplete')+'">'+(complete?'พร้อมใช้งาน':'ตั้งค่าไม่ครบ')+'</span></div><div class="toggle-row"><div class="toggle-label"><strong>เปิดใช้งานภูมิภาคนี้</strong><span>รับ Webhook และประมวลผล OCR</span></div><label class="switch"><input type="checkbox" id="e-'+region+'" '+(item.enabled?'checked':'')+'><span class="slider"></span></label></div><label class="webhook-label" for="w-'+region+'">Webhook URL</label><div class="webhook-row"><input class="webhook-url" type="text" id="w-'+region+'" readonly value="'+escapeHtml(webhookUrl(region))+'"><button class="copy-webhook" type="button" data-copy-region="'+region+'">คัดลอก</button></div>'+field(region,'s','LINE Channel Secret','ใส่เมื่อสร้างหรือเปลี่ยน Secret',item.hasLineSecret)+field(region,'t','LINE Channel Access Token','ใส่เมื่อสร้างหรือเปลี่ยน Token',item.hasLineToken)+field(region,'o','OCR.space API Key','ใส่ API Key ของภูมิภาคนี้',item.hasOcrKey)+'<button class="save-region" data-region="'+region+'">บันทึก '+meta[region].name+'</button></article>'
       }).join('');
       document.querySelectorAll('.save-region').forEach(button=>button.addEventListener('click',()=>save(button.dataset.region,button)));
@@ -1368,7 +1634,7 @@ export function dashboardHtml() { return `<!doctype html>
       if(!items.length){logList.innerHTML='<div class="empty-logs">ยังไม่มีประวัติการตรวจของ '+meta[activeLogRegion].name+'</div>';return}
       logList.innerHTML=items.map(item=>{
         const status=statusInfo(item);const amounts=item.matchedAmount||((item.detectedAmounts||[]).join(', '))||'ไม่พบ';
-        const ocrDetail=item.ocrExcerpt?'<details class="ocr-detail"><summary>ดูข้อความ OCR.space บางส่วน</summary><pre class="ocr-text">'+escapeHtml(item.ocrExcerpt)+'</pre></details>':'';
+        const ocrDetail=item.ocrExcerpt?'<details class="ocr-detail"><summary>ดูข้อความ OCR บางส่วน</summary><pre class="ocr-text">'+escapeHtml(item.ocrExcerpt)+'</pre></details>':'';
         const aiDetail=item.aiResponseExcerpt?'<details class="ocr-detail"><summary>ดูคำตอบ Workers AI Vision</summary><pre class="ocr-text">'+escapeHtml(item.aiResponseExcerpt)+'</pre></details>':'';
         const imageSet=item.imageSetTotal?'<span class="fact">รูปในชุด: '+escapeHtml((item.imageSetIndex??'?')+'/'+item.imageSetTotal)+'</span>':'';
         const ocrAmounts=(item.ocrspaceDetectedAmounts||[]).join(', ')||'ไม่พบ';
@@ -1424,15 +1690,30 @@ export function loginHtml() { return `<!doctype html>
 </html>`; }
 
 async function requeueStuckJobs(env: Env) {
-  const rows = await env.DB.prepare(`SELECT id,region
+  const rows = await env.DB.prepare(`SELECT id,region,status,paddle_job_id,paddle_poll_count
     FROM slip_jobs
-    WHERE status='queued' AND updated_at < datetime('now','-1 minute')
+    WHERE status IN ('queued','paddle_pending') AND updated_at < datetime('now','-1 minute')
     ORDER BY created_at
-    LIMIT 100`).all<{ id: string; region: Region }>();
+    LIMIT 100`).all<{
+      id: string;
+      region: Region;
+      status: string;
+      paddle_job_id: string | null;
+      paddle_poll_count: number;
+    }>();
   let requeued = 0;
   for (const row of rows.results) {
-    await env.OCR_JOBS.send({ id: row.id, region: row.region });
-    await env.DB.prepare("UPDATE slip_jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='queued'")
+    await env.OCR_JOBS.send(row.status === "paddle_pending" && row.paddle_job_id
+      ? {
+          id: row.id,
+          region: row.region,
+          phase: "paddle_poll",
+          paddleJobId: row.paddle_job_id,
+          paddlePollCount: row.paddle_poll_count,
+          paddleAttempted: true
+        } satisfies OcrQueueMessage
+      : { id: row.id, region: row.region } satisfies OcrQueueMessage);
+    await env.DB.prepare("UPDATE slip_jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('queued','paddle_pending')")
       .bind(row.id).run();
     await audit(env, "image_requeued", row.id, row.region);
     requeued++;
@@ -1445,7 +1726,7 @@ async function admin(request: Request, env: Env, url: URL) {
   if (url.pathname === "/admin/login" && request.method === "POST") { const form = await request.formData(); if (!(await safeEqual(String(form.get("password") ?? ""), env.ADMIN_PASSWORD))) return new Response("Unauthorized", { status: 401 }); const payload = `${Date.now() + 8 * 3600_000}`; const token = `${b64(enc.encode(payload))}.${await hmac(payload, env.CONFIG_ENCRYPTION_KEY)}`; return new Response(null, { status: 303, headers: { location: "/admin", "set-cookie": `kplusall_admin=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=28800` } }); }
   const token = cookie(request, "kplusall_admin"); const [body, sig] = token?.split(".") ?? []; const payload = body ? dec.decode(unb64(body)) : "";
   if (!sig || !(await safeEqual(sig, await hmac(payload, env.CONFIG_ENCRYPTION_KEY))) || Number(payload) < Date.now()) return new Response(loginHtml(), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
-  if (url.pathname === "/admin/api/config" && request.method === "GET") { const rows = await env.DB.prepare("SELECT region,enabled,line_channel_secret,line_channel_token,ocrspace_api_key FROM region_config ORDER BY region").all<RegionConfigRow>(); return json(rows.results.map((r) => ({ region:r.region, enabled:Boolean(r.enabled), hasLineSecret:Boolean(r.line_channel_secret), hasLineToken:Boolean(r.line_channel_token), hasOcrKey:Boolean(r.ocrspace_api_key) }))); }
+  if (url.pathname === "/admin/api/config" && request.method === "GET") { const rows = await env.DB.prepare("SELECT region,enabled,line_channel_secret,line_channel_token,ocrspace_api_key FROM region_config ORDER BY region").all<RegionConfigRow>(); return json(rows.results.map((r) => ({ region:r.region, enabled:Boolean(r.enabled), hasLineSecret:Boolean(r.line_channel_secret), hasLineToken:Boolean(r.line_channel_token), hasOcrKey:Boolean(r.ocrspace_api_key), hasPaddleToken:Boolean(env.PADDLEOCR_TOKEN) }))); }
   if (url.pathname === "/admin/api/requeue-stuck" && request.method === "POST") {
     try {
       return json({ ok: true, requeued: await requeueStuckJobs(env) });
@@ -1457,7 +1738,7 @@ async function admin(request: Request, env: Env, url: URL) {
   if (url.pathname === "/admin/api/usage" && request.method === "GET") {
     const region = url.searchParams.get("region") ?? "north";
     if (!isRegion(region)) return json({ error:"invalid region" }, 400);
-    const rows = await env.DB.prepare("SELECT provider,request_count,success_count,error_count FROM daily_usage WHERE usage_date=? AND region=? AND provider IN ('ocrspace','workers_ai_vision') ORDER BY provider")
+    const rows = await env.DB.prepare("SELECT provider,request_count,success_count,error_count FROM daily_usage WHERE usage_date=? AND region=? AND provider IN ('paddleocr','ocrspace','workers_ai_vision') ORDER BY provider")
       .bind(today(), region).all<DailyUsageRow>();
     return json(rows.results.map((row) => ({
       provider: row.provider,
@@ -1467,7 +1748,7 @@ async function admin(request: Request, env: Env, url: URL) {
     })));
   }
   if (url.pathname === "/admin/api/usage-summary" && request.method === "GET") {
-    const rows = await env.DB.prepare("SELECT region,provider,request_count,success_count,error_count FROM daily_usage WHERE usage_date=? AND provider IN ('ocrspace','workers_ai_vision') ORDER BY region,provider")
+    const rows = await env.DB.prepare("SELECT region,provider,request_count,success_count,error_count FROM daily_usage WHERE usage_date=? AND provider IN ('paddleocr','ocrspace','workers_ai_vision') ORDER BY region,provider")
       .bind(today()).all<DailyUsageRow>();
     return json(rows.results.map((row) => ({
       region: row.region,
@@ -1556,6 +1837,6 @@ export default {
     if (url.pathname === "/health") return json({ ok:true, service:"kplusall" });
     return new Response("Kplusall Worker", { status:200 });
   },
-  async queue(batch, env) { for (const message of batch.messages) { try { await processJob(env, message.body as { id:string; region:Region }, message.attempts); message.ack(); } catch (error) { await audit(env,"queue_error",error instanceof Error ? error.message : String(error)); message.retry(); } } },
+  async queue(batch, env) { for (const message of batch.messages) { try { await processJob(env, message.body as OcrQueueMessage, message.attempts); message.ack(); } catch (error) { await audit(env,"queue_error",error instanceof Error ? error.message : String(error)); message.retry(); } } },
   async scheduled(_controller, env, ctx) { ctx.waitUntil(Promise.all([cleanupOldLogs(env), cleanupExpiredImages(env)])); }
 } satisfies ExportedHandler<Env>;

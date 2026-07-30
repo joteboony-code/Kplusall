@@ -31,7 +31,7 @@ describe("control dashboard", () => {
   it("renders the five-region summary and responsive themed controls", () => {
     const html = dashboardHtml();
 
-    expect(html).toContain("ศูนย์จัดการ LINE OA, OCR.space และ Workers AI");
+    expect(html).toContain("ศูนย์จัดการ LINE OA, PaddleOCR, OCR.space และ Workers AI");
     expect(html).toContain('id="active-count"');
     expect(html).toContain("ภาคเหนือ");
     expect(html).toContain("พิษณุโลก");
@@ -55,10 +55,11 @@ describe("control dashboard", () => {
     expect(html).toContain('id="usage-summary"');
     expect(html).toContain('id="ocr-usage-grid"');
     expect(html).toContain("การใช้งาน OCR วันนี้");
-    expect(html).toContain("OCR.space ไม่เกิน 500 ครั้งต่อภาค/วัน");
+    expect(html).toContain("PaddleOCR เป็นตัวหลัก · OCR.space เป็นระบบสำรอง");
     expect(html).toContain("Workers AI Vision");
     expect(html).toContain("ตรวจด้วย:");
-    expect(html).toContain("OCR.space → Workers AI Vision");
+    expect(html).toContain("provider.split('+')");
+    expect(html).toContain("paddleocr:'PaddleOCR'");
     expect(html).toContain("AI มั่นใจ:");
     expect(html).toContain("ผลสุดท้าย ยอด:");
     expect(html).toContain("รูปในชุด:");
