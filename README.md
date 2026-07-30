@@ -7,6 +7,7 @@ Cloudflare Worker เดียวสำหรับ LINE OA 5 พื้นที
 - Worker: `kplusall`
 - D1: `kplusall-db` (APAC)
 - R2: `kplusall-slips` (รูปสลิปเป็น private bucket)
+- LINE Webhook Queue: `kplusall-line-webhooks` (รับ payload แบบ durable ก่อนส่งรูปไป OCR)
 - PaddleOCR Queue: `kplusall-ocr-jobs` (พร้อมกันสูงสุด 5 งาน)
 - OCR.space fallback Queue: `kplusall-ocr-fallback` (พร้อมกันสูงสุด 2 งาน)
 - PaddleOCR AI Studio: `PaddleOCR-VL-1.6` (OCR หลัก)
@@ -25,7 +26,8 @@ rule is a final safety net.
 
 ## Operational safety
 
-- LINE receives HTTP 200 only after D1 persistence and Queue submission succeed.
+- LINE text references are persisted before HTTP 200. Image webhook payloads
+  receive HTTP 200 immediately after durable Queue submission succeeds.
 - One TID has no application-level image-count limit.
 - Images larger than 8 MiB are rejected before OCR and Workers AI.
 - PaddleOCR ใช้ asynchronous job และ Queue ตรวจสถานะทุก 3 วินาที สูงสุด 6 รอบ.
@@ -105,4 +107,6 @@ Webhook URL:
 ถูกใช้ต่อภายในสำหรับโคราช เพื่อรักษา Secret, ประวัติ และตัวนับเดิมโดยไม่ย้ายข้อมูลเสี่ยงสูญหาย
 เส้นทาง `/webhook/central` และ `/webhook/bangkok` ยังรองรับชั่วคราวระหว่างเปลี่ยนการตั้งค่า LINE OA
 
-ระบบไม่ตอบรับตอนรับเลขงานหรือรูป และใช้ Reply API เท่านั้นสำหรับผลตรวจผ่านหรือไม่ผ่านหลัง Queue ประมวลผลเสร็จ.
+ระบบไม่ส่งข้อความตอบรับตอนรับเลขงานหรือรูป โดยรับ image webhook ผ่าน Queue
+แบบ durable ก่อนตอบ HTTP 200 และใช้ Reply API เท่านั้นสำหรับผลตรวจผ่านหรือไม่ผ่าน
+หลัง Queue ประมวลผลเสร็จ.

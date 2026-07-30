@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "kplusall",
   "main": "src/index.ts",
-  "compatibility_date": "2026-07-27",
+  "compatibility_date": "2026-07-30",
   "workers_dev": true,
   "vars": { "PADDLEOCR_MODEL": "PaddleOCR-VL-1.6" },
   "triggers": { "crons": ["17 18 * * *"] },
@@ -21,10 +21,12 @@
   ],
   "queues": {
     "producers": [
+      { "binding": "LINE_WEBHOOKS", "queue": "kplusall-line-webhooks" },
       { "binding": "OCR_JOBS", "queue": "kplusall-ocr-jobs" },
       { "binding": "OCR_FALLBACK_JOBS", "queue": "kplusall-ocr-fallback" }
     ],
     "consumers": [
+      { "queue": "kplusall-line-webhooks", "max_batch_size": 1, "max_retries": 3, "max_concurrency": 5 },
       { "queue": "kplusall-ocr-jobs", "max_batch_size": 1, "max_retries": 1, "max_concurrency": 5 },
       { "queue": "kplusall-ocr-fallback", "max_batch_size": 1, "max_retries": 1, "max_concurrency": 2 }
     ]

@@ -5,8 +5,10 @@ import {
   imageTooLarge,
   MAX_IMAGE_BYTES,
   MAX_OCR_ATTEMPTS,
+  isLineWebhookQueueMessage,
   rankOcrSpaceKeyRegions,
   regionFromWebhookPath,
+  splitLineWebhookEvents,
   shouldRetryOcr
 } from "../src/index";
 
@@ -40,6 +42,25 @@ describe("operational safety limits", () => {
     expect(regionFromWebhookPath("korat")).toBe("bangkok");
     expect(regionFromWebhookPath("north")).toBe("north");
     expect(regionFromWebhookPath("unknown")).toBeNull();
+  });
+
+  it("separates durable image events from synchronous TID references", () => {
+    const events = [
+      { type: "message", message: { type: "text", text: "12345678" } },
+      { type: "message", message: { type: "image", id: "image-1" } },
+      { type: "follow" }
+    ];
+
+    const split = splitLineWebhookEvents(events);
+
+    expect(split.referenceEvents).toHaveLength(1);
+    expect(split.imageEvents).toHaveLength(1);
+    expect(isLineWebhookQueueMessage({
+      kind: "line_webhook",
+      region: "north",
+      events: split.imageEvents,
+      receivedAtMs: 123
+    })).toBe(true);
   });
 
   it("uses the region's own OCR.space key while it has capacity", () => {

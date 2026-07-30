@@ -1,6 +1,7 @@
 type Region = "north" | "central" | "isan" | "south" | "bangkok";
 export type Env = {
-  DB: D1Database; SLIPS: R2Bucket; OCR_JOBS: Queue; OCR_FALLBACK_JOBS: Queue; AI: Ai;
+  DB: D1Database; SLIPS: R2Bucket; LINE_WEBHOOKS: Queue<LineWebhookQueueMessage>;
+  OCR_JOBS: Queue<OcrQueueMessage>; OCR_FALLBACK_JOBS: Queue<OcrQueueMessage>; AI: Ai;
   ADMIN_PASSWORD?: string; CONFIG_ENCRYPTION_KEY?: string;
   PADDLEOCR_TOKEN?: string; PADDLEOCR_MODEL?: string;
 };
@@ -58,6 +59,13 @@ type OcrQueueMessage = {
   ocrSpaceAttempt?: number;
   paddleAttempted?: boolean;
 };
+export type LineWebhookQueueMessage = {
+  kind: "line_webhook";
+  region: Region;
+  events: LineEvent[];
+  receivedAtMs: number;
+};
+type WorkerQueueMessage = OcrQueueMessage | LineWebhookQueueMessage;
 type LatestReplyTokenRow = {
   id: string;
   line_reply_token: string;
@@ -399,7 +407,13 @@ export async function replyInspectionResult(token: string, row: SlipProcessRow, 
     messages: [inspectionResultMessage(row, result)]
   });
 }
+
 async function validSignature(raw: string, signature: string | null, secret: string) { return Boolean(signature) && await safeEqual(await hmac(raw, secret), signature!); }
+
+export function isLineWebhookQueueMessage(value: WorkerQueueMessage): value is LineWebhookQueueMessage {
+  return typeof value === "object" && value !== null &&
+    "kind" in value && value.kind === "line_webhook";
+}
 
 export function imageSetMetadata(event: LineEvent) {
   const imageSet = event.message?.imageSet;
@@ -407,6 +421,17 @@ export function imageSetMetadata(event: LineEvent) {
     id: typeof imageSet?.id === "string" ? imageSet.id : null,
     index: Number.isInteger(imageSet?.index) ? imageSet!.index! : null,
     total: Number.isInteger(imageSet?.total) ? imageSet!.total! : null
+  };
+}
+
+export function splitLineWebhookEvents(events: LineEvent[]) {
+  return {
+    referenceEvents: events.filter(
+      (event) => event.type === "message" && event.message?.type === "text"
+    ),
+    imageEvents: events.filter(
+      (event) => event.type === "message" && event.message?.type === "image"
+    )
   };
 }
 
@@ -432,7 +457,12 @@ export function extractJobNumber(text: unknown) {
   return match?.[1] ?? null;
 }
 
-async function processWebhookEvents(events: LineEvent[], env: Env, region: Region) {
+export async function processWebhookEvents(
+  events: LineEvent[],
+  env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
+  region: Region,
+  receivedAtMs = Date.now()
+) {
   for (const event of events) {
     if (event.type !== "message") continue;
     const scope = lineScopeFromEvent(event);
@@ -485,7 +515,7 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
     const id = crypto.randomUUID();
     const r2Key = `${region}/${today()}/${id}.jpg`;
     const imageSet = imageSetMetadata(event);
-    const replyTokenReceivedAtMs = Date.now();
+    const replyTokenReceivedAtMs = receivedAtMs;
     const inserted = await env.DB.prepare(`INSERT INTO slip_jobs(
         id,region,parent_job_id,line_message_id,line_user_id,r2_key,
         line_reply_token,line_quote_token,webhook_event_id,
@@ -554,6 +584,7 @@ async function recordWebhookFailure(env: Env, region: Region, error: unknown) {
 }
 
 async function webhook(request: Request, env: Env, region: Region) {
+  const receivedAtMs = Date.now();
   let c: RegionConfig;
   try { c = await config(env, region); } catch { return json({ error: "control secrets not initialized" }, 503); }
   if (!c.enabled || !c.lineSecret || !c.lineToken) return json({ error: "region is not configured" }, 503);
@@ -569,9 +600,22 @@ async function webhook(request: Request, env: Env, region: Region) {
     return json({ error: "invalid LINE payload" }, 400);
   }
   try {
-    // Persist every event and enqueue every image before acknowledging LINE.
-    // A 503 lets LINE redeliver if D1 or Queues is temporarily unavailable.
-    await processWebhookEvents(payload.events ?? [], env, region);
+    const events = Array.isArray(payload.events) ? payload.events : [];
+    const { referenceEvents, imageEvents } = splitLineWebhookEvents(events);
+    // Persist the TID before acknowledging it so a later image can always find
+    // its parent. Image events are durably queued as one payload, keeping the
+    // HTTP path short without relying on non-durable background work.
+    if (referenceEvents.length) {
+      await processWebhookEvents(referenceEvents, env, region, receivedAtMs);
+    }
+    if (imageEvents.length) {
+      await env.LINE_WEBHOOKS.send({
+        kind: "line_webhook",
+        region,
+        events: imageEvents,
+        receivedAtMs
+      });
+    }
     return new Response("OK");
   } catch (error) {
     await recordWebhookFailure(env, region, error);
@@ -1850,6 +1894,31 @@ export default {
     if (url.pathname === "/health") return json({ ok:true, service:"kplusall" });
     return new Response("Kplusall Worker", { status:200 });
   },
-  async queue(batch, env) { for (const message of batch.messages) { try { await processJob(env, message.body as OcrQueueMessage, message.attempts); message.ack(); } catch (error) { await audit(env,"queue_error",error instanceof Error ? error.message : String(error)); message.retry(); } } },
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      const body = message.body as WorkerQueueMessage;
+      try {
+        if (isLineWebhookQueueMessage(body)) {
+          await processWebhookEvents(body.events, env, body.region, body.receivedAtMs);
+        } else {
+          await processJob(env, body, message.attempts);
+        }
+        message.ack();
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        try {
+          await audit(
+            env,
+            isLineWebhookQueueMessage(body) ? "webhook_queue_error" : "queue_error",
+            detail,
+            body.region
+          );
+        } catch (auditError) {
+          console.error("failed to audit queue error", { error: detail, auditError });
+        }
+        message.retry();
+      }
+    }
+  },
   async scheduled(_controller, env, ctx) { ctx.waitUntil(Promise.all([cleanupOldLogs(env), cleanupExpiredImages(env)])); }
 } satisfies ExportedHandler<Env>;
