@@ -335,7 +335,11 @@ export function lineScopeFromEvent(event: LineEvent) {
 }
 
 export function extractJobNumber(text: unknown) {
-  const match = String(text ?? "").match(/(?:^|\D)(\d{8})(?!\d)/);
+  const normalized = String(text ?? "")
+    .normalize("NFKC")
+    .replace(/[๐-๙]/g, (digit) => String("๐๑๒๓๔๕๖๗๘๙".indexOf(digit)))
+    .replace(/[\p{Cf}\uFE0E\uFE0F]/gu, "");
+  const match = normalized.match(/(?:^|[^0-9])([0-9]{8})(?![0-9])/);
   return match?.[1] ?? null;
 }
 
@@ -347,7 +351,19 @@ async function processWebhookEvents(events: LineEvent[], env: Env, region: Regio
     const userId = scope.senderId;
     if (event.message?.type === "text") {
       const job = extractJobNumber(event.message.text);
-      if (!job) continue;
+      if (!job) {
+        const text = String(event.message.text ?? "");
+        const digitCount = (text.normalize("NFKC").match(/[0-9๐-๙]/g) ?? []).length;
+        if (digitCount > 0) {
+          await audit(
+            env,
+            "job_reference_not_detected",
+            `digits=${digitCount};length=${[...text].length}`,
+            region
+          );
+        }
+        continue;
+      }
       const id = crypto.randomUUID();
       await env.DB.prepare(`INSERT INTO user_jobs(
           id,region,line_user_id,line_sender_id,line_conversation_id,line_source_type,

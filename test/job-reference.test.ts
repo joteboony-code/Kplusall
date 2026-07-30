@@ -17,6 +17,18 @@ describe("job number extraction from LINE text", () => {
     expect(extractJobNumber("เลขงาน: 12345678, ดำเนินการเรียบร้อย")).toBe("12345678");
   });
 
+  it("normalizes full-width digits from formatted LINE text", () => {
+    expect(extractJobNumber("งานเลข ２２３３４４５５ เรียบร้อย")).toBe("22334455");
+  });
+
+  it("normalizes Thai digits", () => {
+    expect(extractJobNumber("งานเลข ๒๒๓๓๔๔๕๕ เรียบร้อย")).toBe("22334455");
+  });
+
+  it("ignores invisible formatting characters between digits", () => {
+    expect(extractJobNumber("22\u200B33\u20604455")).toBe("22334455");
+  });
+
   it("does not cut an 8-digit job number out of a longer number", () => {
     expect(extractJobNumber("เลขอ้างอิง 0123456789")).toBeNull();
   });
