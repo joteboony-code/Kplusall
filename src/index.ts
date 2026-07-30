@@ -286,6 +286,7 @@ async function lineCall(token: string, endpoint: string, body: unknown) {
 function inspectionResultMessage(row: SlipProcessRow, result: "passed" | "failed") {
   const detectedAmounts = decodeAmounts(row.detected_amounts);
   const detectedAmountText = detectedAmounts.length ? `${detectedAmounts.join(", ")} บาท` : "อ่านยอดไม่ได้";
+  const jobText = `TID: ${row.job_number}`;
   const resultText = result === "passed"
     ? `✅ ตรวจสอบผ่าน: พบสลิป KPLUS\nยอด ${row.matched_amount ?? "1.22"} บาท ข้อมูลถูกต้อง`
     : `❌ ตรวจสอบไม่ผ่าน: สลิป KPLUS\nยอดที่อ่านได้: ${detectedAmountText}\nสาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\nหาก Test ผ่าน Link POS อย่าลืมลง Remark`;
@@ -293,14 +294,14 @@ function inspectionResultMessage(row: SlipProcessRow, result: "passed" | "failed
   if ((row.line_source_type === "group" || row.line_source_type === "room") && row.line_user_id) {
     return {
       type: "textV2",
-      text: `{sender}\n${resultText}`,
+      text: `{sender}\n${jobText}\n${resultText}`,
       ...quote,
       substitution: {
         sender: { type: "mention", mentionee: { type: "user", userId: row.line_user_id } }
       }
     };
   }
-  return { type: "text", text: resultText, ...quote };
+  return { type: "text", text: `${jobText}\n${resultText}`, ...quote };
 }
 
 export async function replyInspectionResult(token: string, row: SlipProcessRow, result: "passed" | "failed") {
