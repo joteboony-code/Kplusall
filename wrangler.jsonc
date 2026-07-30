@@ -20,7 +20,13 @@
     { "binding": "SLIPS", "bucket_name": "kplusall-slips" }
   ],
   "queues": {
-    "producers": [{ "binding": "OCR_JOBS", "queue": "kplusall-ocr-jobs" }],
-    "consumers": [{ "queue": "kplusall-ocr-jobs", "max_batch_size": 1, "max_retries": 1, "max_concurrency": 2 }]
+    "producers": [
+      { "binding": "OCR_JOBS", "queue": "kplusall-ocr-jobs" },
+      { "binding": "OCR_FALLBACK_JOBS", "queue": "kplusall-ocr-fallback" }
+    ],
+    "consumers": [
+      { "queue": "kplusall-ocr-jobs", "max_batch_size": 1, "max_retries": 1, "max_concurrency": 5 },
+      { "queue": "kplusall-ocr-fallback", "max_batch_size": 1, "max_retries": 1, "max_concurrency": 2 }
+    ]
   }
 }

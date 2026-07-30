@@ -7,7 +7,8 @@ Cloudflare Worker เดียวสำหรับ LINE OA 5 พื้นที
 - Worker: `kplusall`
 - D1: `kplusall-db` (APAC)
 - R2: `kplusall-slips` (รูปสลิปเป็น private bucket)
-- Queue: `kplusall-ocr-jobs`
+- PaddleOCR Queue: `kplusall-ocr-jobs` (พร้อมกันสูงสุด 5 งาน)
+- OCR.space fallback Queue: `kplusall-ocr-fallback` (พร้อมกันสูงสุด 2 งาน)
 - PaddleOCR AI Studio: `PaddleOCR-VL-1.6` (OCR หลัก)
 - Workers AI Vision: `@cf/meta/llama-3.2-11b-vision-instruct`
 
@@ -28,7 +29,8 @@ rule is a final safety net.
 - One TID has no application-level image-count limit.
 - Images larger than 8 MiB are rejected before OCR and Workers AI.
 - PaddleOCR ใช้ asynchronous job และ Queue ตรวจสถานะทุก 3 วินาที สูงสุด 6 รอบ.
-- หาก PaddleOCR ผิดพลาด หมดเวลารอ หรือส่งผลที่ไม่มีข้อความ ระบบใช้ OCR.space.
+- หาก PaddleOCR ผิดพลาด หมดเวลารอ หรือส่งผลที่ไม่มีข้อความ ระบบส่งต่อไป Queue แยกสำหรับ OCR.space.
+- PaddleOCR ทำงานพร้อมกันสูงสุด 5 งาน แต่ OCR.space fallback ถูกจำกัดไว้สูงสุด 2 งาน เพื่อป้องกันคำขอพุ่งพร้อมกันเมื่อ PaddleOCR ขัดข้อง.
 - OCR.space errors are retried once, for two attempts total.
 - Result delivery uses the newest unused LINE Reply Token from the same
   region, conversation, sender, and TID. Token age is stored with the result,
@@ -49,7 +51,7 @@ npx wrangler r2 bucket lifecycle list kplusall-slips
 2. รับรูปทุกใบที่ส่งต่อจากเลขงานเดียวกัน รวมถึงชุดรูปที่มี `message.imageSet`.
 3. รูปแต่ละใบถูกส่งเข้าคิว แล้ว Worker ดาวน์โหลดจาก LINE และบันทึก private ใน R2 ก่อนตรวจ.
 4. ใช้ PaddleOCR-VL-1.6 เป็นด่านแรก โดยส่งงานแล้วเก็บ `jobId` ใน D1 จากนั้น Queue ตรวจสถานะแบบหน่วงเวลา โดยไม่วนรอภายใน Worker.
-5. หาก PaddleOCR ใช้งานไม่ได้หรือหมดเวลารอ ใช้ OCR.space ของ region นั้นเป็นระบบสำรอง.
+5. หาก PaddleOCR ใช้งานไม่ได้หรือหมดเวลารอ งานจะถูกส่งเข้า `kplusall-ocr-fallback` แล้วใช้ OCR.space ของ region นั้นเป็นระบบสำรอง โดยมี concurrency สูงสุด 2.
    ระบบจองโควตาใน D1 ก่อนเรียก OCR แบบ atomic. เมื่อ Key ของ region ต้นทางครบ 500 ครั้ง ระบบจะยืม Key ของ region ที่เปิดใช้งานและมีจำนวนการใช้น้อยที่สุดก่อน โดยงานและ LINE OA ยังอยู่กับ region ต้นทางตามเดิม. ระบบหยุดเมื่อ Key ที่พร้อมใช้ทั้งหมดครบ 500 ครั้ง.
 6. หลักฐาน `KPLUS`, `K+`, `THAIQR`, `Thai QR Payment` หรือ `QR PAYMENT` พร้อม `SETTLEMENT` และยอด `1.22` หรือ `-1.22` => `passed`.
 7. หาก OCR หลักพบหลักฐานครบแต่ยังตัดสินไม่ได้ ระบบส่งรูปให้ Workers AI Vision ตรวจซ้ำ; รูปที่มีหลักฐานเพียงอย่างเดียวไม่ใช้ AI.

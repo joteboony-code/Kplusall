@@ -1,6 +1,6 @@
 type Region = "north" | "central" | "isan" | "south" | "bangkok";
 export type Env = {
-  DB: D1Database; SLIPS: R2Bucket; OCR_JOBS: Queue; AI: Ai;
+  DB: D1Database; SLIPS: R2Bucket; OCR_JOBS: Queue; OCR_FALLBACK_JOBS: Queue; AI: Ai;
   ADMIN_PASSWORD?: string; CONFIG_ENCRYPTION_KEY?: string;
   PADDLEOCR_TOKEN?: string; PADDLEOCR_MODEL?: string;
 };
@@ -1128,6 +1128,22 @@ async function loadImageBytes(
   return imageBytes;
 }
 
+async function enqueueOcrSpaceFallback(
+  env: Env,
+  row: Pick<SlipProcessRow, "id" | "region">,
+  paddleAttempted: boolean,
+  ocrSpaceAttempt = 1,
+  delaySeconds = 0
+) {
+  await env.OCR_FALLBACK_JOBS.send({
+    id: row.id,
+    region: row.region,
+    phase: "ocrspace",
+    ocrSpaceAttempt,
+    paddleAttempted
+  } satisfies OcrQueueMessage, delaySeconds > 0 ? { delaySeconds } : undefined);
+}
+
 async function runOcrSpaceFallback(
   env: Env,
   row: SlipProcessRow,
@@ -1184,13 +1200,7 @@ async function runOcrSpaceFallback(
           `OCR.space ผิดพลาดครั้งที่ ${ocrAttempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
           row.id
         ).run();
-      await env.OCR_JOBS.send({
-        id: row.id,
-        region: row.region,
-        phase: "ocrspace",
-        ocrSpaceAttempt: ocrAttempt + 1,
-        paddleAttempted
-      } satisfies OcrQueueMessage, { delaySeconds: 2 });
+      await enqueueOcrSpaceFallback(env, row, paddleAttempted, ocrAttempt + 1, 2);
       return;
     }
     await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider=?,ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
@@ -1240,13 +1250,7 @@ async function runOcrSpaceFallback(
           `OCR.space ผิดพลาดครั้งที่ ${ocrAttempt}; กำลัง retry อีก 1 ครั้ง: ${errorDetail}`.slice(0, 1000),
           row.id
         ).run();
-      await env.OCR_JOBS.send({
-        id: row.id,
-        region: row.region,
-        phase: "ocrspace",
-        ocrSpaceAttempt: ocrAttempt + 1,
-        paddleAttempted
-      } satisfies OcrQueueMessage, { delaySeconds: 2 });
+      await enqueueOcrSpaceFallback(env, row, paddleAttempted, ocrAttempt + 1, 2);
       return;
     }
     await env.DB.prepare("UPDATE slip_jobs SET status='ocr_error',result='needs_fallback',ocr_provider=?,ocrspace_key_region=?,ocr_text=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
@@ -1328,7 +1332,9 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
   const paddleToken = env.PADDLEOCR_TOKEN?.trim();
   if (!paddleToken) {
     await audit(env, "paddleocr_not_configured", `${row.job_number}: ใช้ OCR.space`, row.region);
-    await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, false);
+    await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='ocrspace',decision_reason='ไม่ได้ตั้งค่า PaddleOCR จึงรอ OCR.space',updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(row.id).run();
+    await enqueueOcrSpaceFallback(env, row, false);
     return;
   }
 
@@ -1369,7 +1375,7 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
       await audit(env, "paddleocr_submit_error", detail, row.region);
       await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='paddleocr',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
         .bind(`PaddleOCR ส่งงานไม่สำเร็จ จึงใช้ OCR.space: ${detail}`.slice(0, 1000), row.id).run();
-      await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, true);
+      await enqueueOcrSpaceFallback(env, row, true);
       return;
     }
   }
@@ -1378,7 +1384,9 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
   if (!jobId) {
     await recordPaddleOcrOutcome(env, row.region, false);
     await audit(env, "paddleocr_job_missing", row.job_number, row.region);
-    await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, true);
+    await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='paddleocr',decision_reason='ไม่พบ PaddleOCR jobId จึงรอ OCR.space',updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .bind(row.id).run();
+    await enqueueOcrSpaceFallback(env, row, true);
     return;
   }
   try {
@@ -1437,7 +1445,7 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
     await audit(env, "paddleocr_error", `${jobId}: ${detail}`, row.region);
     await env.DB.prepare("UPDATE slip_jobs SET status='queued',ocr_provider='paddleocr',decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
       .bind(`PaddleOCR ไม่สำเร็จ จึงใช้ OCR.space: ${detail}`.slice(0, 1000), row.id).run();
-    await runOcrSpaceFallback(env, row, c.lineToken, imageBytes, 1, true);
+    await enqueueOcrSpaceFallback(env, row, true);
   }
 }
 
@@ -1690,7 +1698,7 @@ export function loginHtml() { return `<!doctype html>
 </html>`; }
 
 async function requeueStuckJobs(env: Env) {
-  const rows = await env.DB.prepare(`SELECT id,region,status,paddle_job_id,paddle_poll_count
+  const rows = await env.DB.prepare(`SELECT id,region,status,ocr_provider,paddle_job_id,paddle_poll_count
     FROM slip_jobs
     WHERE status IN ('queued','paddle_pending') AND updated_at < datetime('now','-1 minute')
     ORDER BY created_at
@@ -1698,13 +1706,17 @@ async function requeueStuckJobs(env: Env) {
       id: string;
       region: Region;
       status: string;
+      ocr_provider: string | null;
       paddle_job_id: string | null;
       paddle_poll_count: number;
     }>();
   let requeued = 0;
   for (const row of rows.results) {
-    await env.OCR_JOBS.send(row.status === "paddle_pending" && row.paddle_job_id
-      ? {
+    if (row.status === "queued" && row.ocr_provider?.includes("ocrspace")) {
+      await enqueueOcrSpaceFallback(env, row, row.ocr_provider.includes("paddleocr"));
+    } else {
+      await env.OCR_JOBS.send(row.status === "paddle_pending" && row.paddle_job_id
+        ? {
           id: row.id,
           region: row.region,
           phase: "paddle_poll",
@@ -1712,7 +1724,8 @@ async function requeueStuckJobs(env: Env) {
           paddlePollCount: row.paddle_poll_count,
           paddleAttempted: true
         } satisfies OcrQueueMessage
-      : { id: row.id, region: row.region } satisfies OcrQueueMessage);
+        : { id: row.id, region: row.region } satisfies OcrQueueMessage);
+    }
     await env.DB.prepare("UPDATE slip_jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('queued','paddle_pending')")
       .bind(row.id).run();
     await audit(env, "image_requeued", row.id, row.region);
