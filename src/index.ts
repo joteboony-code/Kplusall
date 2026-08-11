@@ -93,6 +93,7 @@ type SlipProcessRow = {
   line_reply_token: string;
   line_quote_token: string | null;
   line_source_type: "user" | "group" | "room";
+  created_at?: string;
   matched_amount: string | null;
   detected_amounts: string | null;
   decision_reason: string | null;
@@ -120,7 +121,7 @@ const PADDLEOCR_PROVIDER = "paddleocr";
 const PADDLEOCR_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
 export const DEFAULT_PADDLEOCR_MODEL = "PaddleOCR-VL-1.6";
 export const PADDLEOCR_POLL_DELAY_SECONDS = 3;
-export const MAX_PADDLEOCR_POLLS = 6;
+export const MAX_PADDLEOCR_POLLS = 3;
 export const VISIBLE_TEXT_PROMPT = `Transcribe only text that is clearly visible in this image.
 Preserve line breaks, decimal points, and minus signs exactly as printed.
 Do not describe the image, infer hidden text, correct values, or add commentary.
@@ -141,6 +142,32 @@ export function bangkokDate(now = new Date()) {
   return `${value("year")}-${value("month")}-${value("day")}`;
 }
 function today() { return bangkokDate(); }
+
+function sqlTimestampMs(value: string): number | undefined {
+  const normalized = value.trim().replace(" ", "T");
+  const parsed = Date.parse(/[zZ]|[+-]\d\d:\d\d$/.test(normalized)
+    ? normalized
+    : `${normalized}Z`);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Inspection jobs are intentionally valid only on their Bangkok calendar day. */
+export function isCurrentInspectionDay(
+  value: string | number | null | undefined,
+  now = Date.now(),
+): boolean {
+  const timestamp = typeof value === "number"
+    ? value
+    : typeof value === "string"
+      ? sqlTimestampMs(value)
+      : undefined;
+  if (!Number.isFinite(timestamp) || timestamp === undefined || timestamp <= 0) {
+    return true;
+  }
+  return bangkokDate(new Date(timestamp)) === bangkokDate(new Date(now));
+}
+
+const EXPIRED_INSPECTION_REASON = "งานข้ามวันแล้ว จึงยุติการตรวจและไม่ส่งผลย้อนหลัง";
 function isRegion(value: string): value is Region { return REGIONS.includes(value as Region); }
 export function regionFromWebhookPath(value: string): Region | null {
   return WEBHOOK_REGION_ALIASES[value] ?? (isRegion(value) ? value : null);
@@ -280,6 +307,32 @@ async function config(env: Env, region: Region): Promise<RegionConfig> {
   return { region, enabled: Boolean(row.enabled), lineSecret: await open(row.line_channel_secret, env), lineToken: await open(row.line_channel_token, env), ocrKey: await open(row.ocrspace_api_key, env) };
 }
 async function audit(env: Pick<Env, "DB">, event: string, detail: string, region?: Region) { await env.DB.prepare("INSERT INTO audit_logs(region,event_type,detail) VALUES(?,?,?)").bind(region ?? null, event, detail.slice(0, 1000)).run(); }
+function queueErrorText(error: unknown) {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 500);
+}
+async function auditQueueDeferral(env: Pick<Env, "DB">, target: string, detail: string, region: Region) {
+  try {
+    await audit(env, "queue_write_deferred", `${target}: ${detail}`, region);
+  } catch (auditError) {
+    console.error("failed to audit deferred queue write", { target, region, error: detail, auditError });
+  }
+}
+async function enqueueOcrJobSafely(
+  env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
+  message: OcrQueueMessage,
+  region: Region,
+  options?: QueueSendOptions,
+) {
+  try {
+    await env.OCR_JOBS.send(message, options);
+    return true;
+  } catch (error) {
+    const detail = queueErrorText(error);
+    console.error(JSON.stringify({ event: "queue_write_deferred", target: "ocr-jobs", region, error: detail, id: message.id }));
+    await auditQueueDeferral(env, "ocr-jobs", `${message.id}: ${detail}`, region);
+    return false;
+  }
+}
 export async function reserveOcrSpaceUsage(env: Pick<Env, "DB">, region: Region) {
   await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,'ocrspace')")
     .bind(today(), region).run();
@@ -465,6 +518,15 @@ export async function processWebhookEvents(
 ) {
   for (const event of events) {
     if (event.type !== "message") continue;
+    if (event.timestamp !== undefined && !isCurrentInspectionDay(event.timestamp)) {
+      await audit(
+        env,
+        "event_expired",
+        event.message?.id ?? event.webhookEventId ?? "unknown",
+        region,
+      );
+      continue;
+    }
     const scope = lineScopeFromEvent(event);
     if (!scope) continue;
     const userId = scope.senderId;
@@ -558,7 +620,7 @@ export async function processWebhookEvents(
         (!duplicate.result_sent_at &&
           (duplicate.status === "passed" || duplicate.status === "failed"))
       )) {
-        await env.OCR_JOBS.send({ id: duplicate.id, region });
+        await enqueueOcrJobSafely(env, { id: duplicate.id, region }, region);
       }
       await audit(
         env,
@@ -568,7 +630,7 @@ export async function processWebhookEvents(
       );
       continue;
     }
-    await env.OCR_JOBS.send({ id, region });
+    await enqueueOcrJobSafely(env, { id, region }, region);
     await audit(env, "image_queued", `${parent.job_number}${imageSet.total ? ` รูป ${imageSet.index ?? "?"}/${imageSet.total}` : ""}`, region);
   }
 }
@@ -609,12 +671,7 @@ async function webhook(request: Request, env: Env, region: Region) {
       await processWebhookEvents(referenceEvents, env, region, receivedAtMs);
     }
     if (imageEvents.length) {
-      await env.LINE_WEBHOOKS.send({
-        kind: "line_webhook",
-        region,
-        events: imageEvents,
-        receivedAtMs
-      });
+      await processWebhookEvents(imageEvents, env, region, receivedAtMs);
     }
     return new Response("OK");
   } catch (error) {
@@ -1179,13 +1236,31 @@ async function enqueueOcrSpaceFallback(
   ocrSpaceAttempt = 1,
   delaySeconds = 0
 ) {
-  await env.OCR_FALLBACK_JOBS.send({
+  const message = {
     id: row.id,
     region: row.region,
     phase: "ocrspace",
     ocrSpaceAttempt,
     paddleAttempted
-  } satisfies OcrQueueMessage, delaySeconds > 0 ? { delaySeconds } : undefined);
+  } satisfies OcrQueueMessage;
+  try {
+    await env.OCR_FALLBACK_JOBS.send(
+      message,
+      delaySeconds > 0 ? { delaySeconds } : undefined
+    );
+    return true;
+  } catch (error) {
+    const detail = queueErrorText(error);
+    console.error(JSON.stringify({
+      event: "queue_write_deferred",
+      target: "ocr-fallback",
+      region: row.region,
+      id: row.id,
+      error: detail,
+    }));
+    await auditQueueDeferral(env, "ocr-fallback", `${row.id}: ${detail}`, row.region);
+    return false;
+  }
 }
 
 async function runOcrSpaceFallback(
@@ -1335,10 +1410,24 @@ async function runOcrSpaceFallback(
   );
 }
 
+async function suppressExpiredSlip(env: Env, row: SlipProcessRow) {
+  await env.DB.prepare(`UPDATE slip_jobs SET
+      status='suppressed', result='silent', decision_reason=?, updated_at=CURRENT_TIMESTAMP
+    WHERE id=? AND status IN ('queued','paddle_pending','passed','failed')`)
+    .bind(EXPIRED_INSPECTION_REASON, row.id)
+    .run();
+  await audit(env, "inspection_expired", row.job_number, row.region);
+  await deleteCachedImage(env, row);
+}
+
 async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
   const row = await env.DB.prepare("SELECT s.*,u.job_number,u.line_source_type,u.result_sent_at FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id WHERE s.id=? AND s.region=?")
     .bind(data.id, data.region).first<SlipProcessRow>();
   if (!row) return;
+  if (!isCurrentInspectionDay(row.created_at)) {
+    await suppressExpiredSlip(env, row);
+    return;
+  }
   const c = await config(env, data.region);
   if (!c.enabled || !c.lineToken) throw new Error("region configuration unavailable");
   if ((row.status === "passed" || row.status === "failed") && !row.result_sent_at) {
@@ -1403,14 +1492,14 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
           updated_at=CURRENT_TIMESTAMP
         WHERE id=?`)
         .bind(PADDLEOCR_PROVIDER, jobId, row.id).run();
-      await env.OCR_JOBS.send({
+      await enqueueOcrJobSafely(env, {
         id: row.id,
         region: row.region,
         phase: "paddle_poll",
         paddleJobId: jobId,
         paddlePollCount: 0,
         paddleAttempted: true
-      } satisfies OcrQueueMessage, { delaySeconds: PADDLEOCR_POLL_DELAY_SECONDS });
+      } satisfies OcrQueueMessage, row.region, { delaySeconds: PADDLEOCR_POLL_DELAY_SECONDS });
       await audit(env, "paddleocr_submitted", `${row.job_number}: ${jobId}`, row.region);
       return;
     } catch (error) {
@@ -1447,14 +1536,14 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
       }
       await env.DB.prepare("UPDATE slip_jobs SET paddle_poll_count=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
         .bind(pollCount, `PaddleOCR กำลังประมวลผล (${pollCount}/${MAX_PADDLEOCR_POLLS})`, row.id).run();
-      await env.OCR_JOBS.send({
+      await enqueueOcrJobSafely(env, {
         id: row.id,
         region: row.region,
         phase: "paddle_poll",
         paddleJobId: jobId,
         paddlePollCount: pollCount,
         paddleAttempted: true
-      } satisfies OcrQueueMessage, { delaySeconds: PADDLEOCR_POLL_DELAY_SECONDS });
+      } satisfies OcrQueueMessage, row.region, { delaySeconds: PADDLEOCR_POLL_DELAY_SECONDS });
       return;
     }
     if (state === "failed") {
@@ -1525,6 +1614,23 @@ async function cleanupExpiredImages(env: Env) {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   console.log(JSON.stringify({ event: "r2_daily_cleanup", retentionHours: 24, deleted }));
+}
+
+async function expireStaleQueuedJobs(env: Env): Promise<number> {
+  // CURRENT_TIMESTAMP is UTC in D1. +7 hours makes the comparison use the
+  // Bangkok calendar boundary (17:00 UTC), so yesterday's work is never
+  // requeued after midnight Thailand time.
+  const result = await env.DB.prepare(`UPDATE slip_jobs
+    SET status='suppressed', result='silent', decision_reason=?, updated_at=CURRENT_TIMESTAMP
+    WHERE status IN ('queued','paddle_pending')
+      AND created_at < datetime('now','+7 hours','start of day','-7 hours')`)
+    .bind(EXPIRED_INSPECTION_REASON)
+    .run();
+  const expired = result.meta.changes ?? 0;
+  if (expired > 0) {
+    await audit(env, "inspection_expired", `${expired} queued job(s)`);
+  }
+  return expired;
 }
 
 export function dashboardHtml() { return `<!doctype html>
@@ -1744,7 +1850,9 @@ export function loginHtml() { return `<!doctype html>
 async function requeueStuckJobs(env: Env) {
   const rows = await env.DB.prepare(`SELECT id,region,status,ocr_provider,paddle_job_id,paddle_poll_count
     FROM slip_jobs
-    WHERE status IN ('queued','paddle_pending') AND updated_at < datetime('now','-1 minute')
+    WHERE status IN ('queued','paddle_pending')
+      AND updated_at < datetime('now','-1 minute')
+      AND created_at >= datetime('now','+7 hours','start of day','-7 hours')
     ORDER BY created_at
     LIMIT 100`).all<{
       id: string;
@@ -1756,10 +1864,11 @@ async function requeueStuckJobs(env: Env) {
     }>();
   let requeued = 0;
   for (const row of rows.results) {
+    let queued: boolean;
     if (row.status === "queued" && row.ocr_provider?.includes("ocrspace")) {
-      await enqueueOcrSpaceFallback(env, row, row.ocr_provider.includes("paddleocr"));
+      queued = await enqueueOcrSpaceFallback(env, row, row.ocr_provider.includes("paddleocr"));
     } else {
-      await env.OCR_JOBS.send(row.status === "paddle_pending" && row.paddle_job_id
+      queued = await enqueueOcrJobSafely(env, row.status === "paddle_pending" && row.paddle_job_id
         ? {
           id: row.id,
           region: row.region,
@@ -1768,8 +1877,9 @@ async function requeueStuckJobs(env: Env) {
           paddlePollCount: row.paddle_poll_count,
           paddleAttempted: true
         } satisfies OcrQueueMessage
-        : { id: row.id, region: row.region } satisfies OcrQueueMessage);
+        : { id: row.id, region: row.region } satisfies OcrQueueMessage, row.region);
     }
+    if (!queued) continue;
     await env.DB.prepare("UPDATE slip_jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('queued','paddle_pending')")
       .bind(row.id).run();
     await audit(env, "image_requeued", row.id, row.region);
@@ -1897,6 +2007,16 @@ export default {
   async queue(batch, env) {
     for (const message of batch.messages) {
       const body = message.body as WorkerQueueMessage;
+      if (isLineWebhookQueueMessage(body) &&
+          !isCurrentInspectionDay(body.receivedAtMs)) {
+        console.log(JSON.stringify({
+          event: "webhook_queue_expired",
+          region: body.region,
+          receivedAtMs: body.receivedAtMs,
+        }));
+        message.ack();
+        continue;
+      }
       try {
         if (isLineWebhookQueueMessage(body)) {
           await processWebhookEvents(body.events, env, body.region, body.receivedAtMs);
@@ -1920,5 +2040,24 @@ export default {
       }
     }
   },
-  async scheduled(_controller, env, ctx) { ctx.waitUntil(Promise.all([cleanupOldLogs(env), cleanupExpiredImages(env)])); }
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil((async () => {
+      try {
+        const scheduledAt = new Date(controller.scheduledTime);
+        const runDailyCleanup = scheduledAt.getUTCHours() === 18 && scheduledAt.getUTCMinutes() === 0;
+        const expired = await expireStaleQueuedJobs(env);
+        const tasks: Array<Promise<number | void>> = [requeueStuckJobs(env)];
+        if (runDailyCleanup) {
+          tasks.push(cleanupOldLogs(env), cleanupExpiredImages(env));
+        }
+        const [requeued] = await Promise.all(tasks);
+        console.log(JSON.stringify({ event: "scheduled_recovery_completed", expired, requeued, runDailyCleanup }));
+      } catch (error) {
+        console.error(JSON.stringify({
+          event: "scheduled_recovery_failed",
+          error: queueErrorText(error),
+        }));
+      }
+    })());
+  }
 } satisfies ExportedHandler<Env>;

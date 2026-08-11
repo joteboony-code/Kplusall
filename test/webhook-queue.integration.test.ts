@@ -46,4 +46,24 @@ describe("durable LINE webhook ingestion", () => {
       image_set_total: 1
     });
   });
+
+  it("keeps the durable image row when the OCR queue is over quota", async () => {
+    const send = vi.fn().mockRejectedValue(new Error("daily write operations limit"));
+
+    await processWebhookEvents([{
+      type: "message",
+      webhookEventId: "webhook-deferred",
+      replyToken: "reply-deferred",
+      source: { type: "user", userId: "user-1" },
+      message: { id: "line-image-deferred", type: "image" }
+    }], { DB: env.DB, OCR_JOBS: { send } }, "north", 1_785_426_752_448);
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(
+      "SELECT status FROM slip_jobs WHERE line_message_id='line-image-deferred'"
+    ).first()).toMatchObject({ status: "queued" });
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM audit_logs WHERE event_type='queue_write_deferred'"
+    ).first()).toMatchObject({ count: 1 });
+  });
 });

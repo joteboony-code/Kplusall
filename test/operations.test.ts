@@ -3,8 +3,10 @@ import {
   bangkokDate,
   imageExpired,
   imageTooLarge,
+  isCurrentInspectionDay,
   MAX_IMAGE_BYTES,
   MAX_OCR_ATTEMPTS,
+  MAX_PADDLEOCR_POLLS,
   isLineWebhookQueueMessage,
   rankOcrSpaceKeyRegions,
   regionFromWebhookPath,
@@ -37,11 +39,21 @@ describe("operational safety limits", () => {
     expect(bangkokDate(new Date("2026-07-28T17:00:00.000Z"))).toBe("2026-07-29");
   });
 
+  it("expires inspection work at the Bangkok calendar boundary", () => {
+    const now = Date.parse("2026-07-28T16:00:00.000Z");
+    expect(isCurrentInspectionDay("2026-07-28 16:59:59", now)).toBe(true);
+    expect(isCurrentInspectionDay("2026-07-28 16:59:59", Date.parse("2026-07-29T17:00:00.000Z"))).toBe(false);
+  });
+
   it("maps the new public webhook paths onto the preserved database regions", () => {
     expect(regionFromWebhookPath("phitsanulok")).toBe("central");
     expect(regionFromWebhookPath("korat")).toBe("bangkok");
     expect(regionFromWebhookPath("north")).toBe("north");
     expect(regionFromWebhookPath("unknown")).toBeNull();
+  });
+
+  it("caps PaddleOCR polling to one initial attempt plus two retries", () => {
+    expect(MAX_PADDLEOCR_POLLS).toBe(3);
   });
 
   it("separates durable image events from synchronous TID references", () => {
