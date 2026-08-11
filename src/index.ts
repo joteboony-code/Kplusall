@@ -546,10 +546,15 @@ export async function processWebhookEvents(
         continue;
       }
       const id = crypto.randomUUID();
+      const referenceTimestampMs = isCurrentInspectionDay(event.timestamp)
+        ? (typeof event.timestamp === "number" && event.timestamp > 0
+          ? event.timestamp
+          : receivedAtMs)
+        : receivedAtMs;
       await env.DB.prepare(`INSERT INTO user_jobs(
           id,region,line_user_id,line_sender_id,line_conversation_id,line_source_type,
           job_number,status,expires_at,reference_set_at
-        ) VALUES(?,?,?,?,?,?,?, 'collecting',datetime('now',?),strftime('%Y-%m-%d %H:%M:%f','now'))
+        ) VALUES(?,?,?,?,?,?,?, 'collecting',datetime('now',?),strftime('%Y-%m-%d %H:%M:%f',?/1000.0,'unixepoch'))
         ON CONFLICT(region,line_user_id,job_number) DO UPDATE SET
           status=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN 'collecting' ELSE user_jobs.status END,
           final_result=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN NULL ELSE user_jobs.final_result END,
@@ -557,18 +562,34 @@ export async function processWebhookEvents(
           result_claim_token=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN NULL ELSE user_jobs.result_claim_token END,
           result_sent_at=CASE WHEN user_jobs.expires_at <= CURRENT_TIMESTAMP THEN NULL ELSE user_jobs.result_sent_at END,
           expires_at=datetime('now',?),
-          reference_set_at=strftime('%Y-%m-%d %H:%M:%f','now'),
+          reference_set_at=strftime('%Y-%m-%d %H:%M:%f',?/1000.0,'unixepoch'),
           updated_at=CURRENT_TIMESTAMP`)
         .bind(
           id, region, scope.identityKey, userId, scope.conversationId, scope.sourceType, job,
-          `+${JOB_REFERENCE_MINUTES} minutes`, `+${JOB_REFERENCE_MINUTES} minutes`
+          `+${JOB_REFERENCE_MINUTES} minutes`, referenceTimestampMs,
+          `+${JOB_REFERENCE_MINUTES} minutes`, referenceTimestampMs,
         ).run();
       await audit(env, "job_received", job, region);
       continue;
     }
     if (event.message?.type !== "image" || !event.message.id || !event.replyToken) continue;
-    const parent = await env.DB.prepare("SELECT id,job_number FROM user_jobs WHERE region=? AND line_conversation_id=? AND line_sender_id=? AND expires_at>CURRENT_TIMESTAMP ORDER BY reference_set_at DESC,rowid DESC LIMIT 1")
-      .bind(region, scope.conversationId, userId).first<ActiveUserJob>();
+    const hasEventTimestamp = typeof event.timestamp === "number" &&
+      Number.isFinite(event.timestamp) && event.timestamp > 0;
+    const parentQuery = hasEventTimestamp
+      ? `SELECT id,job_number FROM user_jobs
+          WHERE region=? AND line_conversation_id=? AND line_sender_id=?
+            AND expires_at>CURRENT_TIMESTAMP
+            AND reference_set_at<=strftime('%Y-%m-%d %H:%M:%f',?/1000.0,'unixepoch')
+          ORDER BY reference_set_at DESC,rowid DESC LIMIT 1`
+      : `SELECT id,job_number FROM user_jobs
+          WHERE region=? AND line_conversation_id=? AND line_sender_id=?
+            AND expires_at>CURRENT_TIMESTAMP
+          ORDER BY reference_set_at DESC,rowid DESC LIMIT 1`;
+    const parent = await env.DB.prepare(parentQuery)
+      .bind(...(hasEventTimestamp
+        ? [region, scope.conversationId, userId, event.timestamp]
+        : [region, scope.conversationId, userId]))
+      .first<ActiveUserJob>();
     if (!parent) {
       await audit(env, "image_ignored_no_active_job", event.message.id, region);
       continue;

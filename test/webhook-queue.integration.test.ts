@@ -66,4 +66,38 @@ describe("durable LINE webhook ingestion", () => {
       "SELECT COUNT(*) AS count FROM audit_logs WHERE event_type='queue_write_deferred'"
     ).first()).toMatchObject({ count: 1 });
   });
+
+  it("binds a delayed image to the TID that existed at the LINE event time", async () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const now = Date.now();
+
+    await processWebhookEvents([
+      {
+        type: "message",
+        timestamp: now - 2_000,
+        source: { type: "user", userId: "user-1" },
+        message: { type: "text", text: "28401904" }
+      },
+      {
+        type: "message",
+        timestamp: now - 1_000,
+        source: { type: "user", userId: "user-1" },
+        message: { type: "text", text: "28253121" }
+      },
+      {
+        type: "message",
+        timestamp: now - 1_500,
+        webhookEventId: "webhook-delayed-image",
+        replyToken: "reply-delayed-image",
+        source: { type: "user", userId: "user-1" },
+        message: { id: "line-image-delayed", type: "image" }
+      }
+    ], { DB: env.DB, OCR_JOBS: { send } }, "north", now);
+
+    expect(await env.DB.prepare(`SELECT u.job_number
+      FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id
+      WHERE s.line_message_id='line-image-delayed'`).first()).toMatchObject({
+      job_number: "28401904"
+    });
+  });
 });
