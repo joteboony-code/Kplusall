@@ -335,7 +335,7 @@ VOID -THB 1.22`);
     }, Date.parse("2026-08-13T12:00:20Z"))).toBe("wait");
   });
 
-  it("does not wait for missing images when every received OCR result is done", () => {
+  it("waits for the rest of a known image set before deciding", () => {
     expect(pendingResultDecision({
       imageCount: 1,
       expectedImageCount: 10,
@@ -344,7 +344,7 @@ VOID -THB 1.22`);
       passedCount: 0,
       firstFailedAt: "2026-08-13 12:00:00",
       latestCreatedAt: "2026-08-13 12:00:00"
-    }, Date.parse("2026-08-13T12:00:01Z"))).toBe("failed");
+    }, Date.parse("2026-08-13T12:00:01Z"))).toBe("awaiting_images");
   });
 
   it("stops waiting after the 45-second OCR result timeout", () => {

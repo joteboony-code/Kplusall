@@ -349,19 +349,26 @@ type PendingResultState = {
   latestCreatedAt: string | null;
 };
 
-export type PendingResultDecision = "wait" | "passed" | "failed" | "silent";
+export type PendingResultDecision = "wait" | "awaiting_images" | "passed" | "failed" | "silent";
 
 /**
  * A wrong amount on one image is not final while an OCR result is still
- * pending. A matching image always wins immediately; otherwise a failed result
- * is delivered as soon as all received images finish, with the 45-second
- * timeout acting only as a safety limit for a stuck OCR result.
+ * pending. A matching image always wins immediately. When LINE tells us the
+ * total image-set size, do not finalize until every image in that set arrives;
+ * for standalone images, the 45-second timeout remains the safety limit for a
+ * stuck OCR result.
  */
 export function pendingResultDecision(
   state: PendingResultState,
   nowMs = Date.now()
 ): PendingResultDecision {
   if (state.passedCount > 0) return "passed";
+  if (
+    state.expectedImageCount > 0 &&
+    state.imageCount < state.expectedImageCount
+  ) {
+    return "awaiting_images";
+  }
   if (state.pendingCount > 0) {
     const failedAtMs = state.firstFailedAt
       ? Date.parse(`${state.firstFailedAt.replace(" ", "T")}Z`)
@@ -401,7 +408,9 @@ async function deferFailedResult(
     .run();
   if ((claimed.meta.changes ?? 0) !== 1) return;
   const state = await pendingResultState(env, row.parent_job_id);
-  if (state && pendingResultDecision(state) !== "wait") {
+  const decision = state ? pendingResultDecision(state) : "wait";
+  if (decision === "awaiting_images") return;
+  if (state && decision !== "wait") {
     await finalizePendingResult(env, row, lineToken);
     return;
   }
@@ -456,6 +465,7 @@ async function finalizePendingResult(
   const state = await pendingResultState(env, row.parent_job_id);
   if (!state) return;
   const decision = pendingResultDecision(state);
+  if (decision === "awaiting_images") return;
   if (decision === "wait") {
     const firstFailedMs = state.firstFailedAt
       ? Date.parse(`${state.firstFailedAt.replace(" ", "T")}Z`)
@@ -500,7 +510,9 @@ async function settlePendingResultIfReady(
     .first<{ status: string; result_sent_at: string | null }>();
   if (!parent || parent.result_sent_at || parent.status !== "pending_failed") return;
   const state = await pendingResultState(env, row.parent_job_id);
-  if (!state || pendingResultDecision(state) === "wait") return;
+  if (!state) return;
+  const decision = pendingResultDecision(state);
+  if (decision === "wait" || decision === "awaiting_images") return;
   await finalizePendingResult(env, row, lineToken);
 }
 export async function reserveOcrSpaceUsage(env: Pick<Env, "DB">, region: Region) {
@@ -608,7 +620,7 @@ function inspectionResultMessage(row: SlipProcessRow, result: "passed" | "failed
   const jobText = `TID: ${row.job_number}`;
   const resultText = result === "passed"
     ? `✅ ตรวจสอบผ่าน: พบ KPLUS + SETTLEMENT + ยอด ${row.matched_amount ?? "1.22"} บาท ข้อมูลถูกต้อง`
-    : `❌ ตรวจสอบไม่พบยอด 1.22: สลิป KPLUS\nยอดที่อ่านได้: ${detectedAmountText}\nสาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\nหาก Test ผ่าน Link POS อย่าลืมลง Remark`;
+    : `❌ ตรวจสอบไม่พบยอด 1.22: พบ KPLUS + SETTLEMENT แต่ยอดไม่ตรง\nยอดที่อ่านได้: ${detectedAmountText}\nสาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\nหาก Test ผ่าน Link POS อย่าลืมลง Remark`;
   const quote = row.line_quote_token ? { quoteToken: row.line_quote_token } : {};
   if ((row.line_source_type === "group" || row.line_source_type === "room") && row.line_user_id) {
     return {
