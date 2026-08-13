@@ -1990,6 +1990,10 @@ export function dashboardHtml() { return `<!doctype html>
     .section-head h2{margin:0;font-size:21px}
     .section-head p{margin:3px 0 0;color:var(--muted);font-size:13px}
     .secure-note{display:flex;align-items:center;gap:7px;padding:8px 12px;border-radius:999px;color:#6e518e;background:rgba(255,255,255,.7);font-size:12px;font-weight:700}
+    .view-tabs{display:flex;gap:8px;margin:18px 4px 0;padding:5px;border:1px solid rgba(255,255,255,.9);border-radius:16px;background:rgba(255,255,255,.62);box-shadow:0 9px 25px rgba(73,55,108,.07)}
+    .view-tab{padding:9px 14px;border:0;border-radius:11px;color:var(--muted);background:transparent;font-weight:800;cursor:pointer;transition:.18s}
+    .view-tab:hover{color:var(--ink);background:#faf8fd}.view-tab.active{color:white;background:linear-gradient(100deg,var(--pink),var(--purple));box-shadow:0 7px 18px rgba(139,92,246,.2)}
+    .control-view[hidden]{display:none}
     .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
     .region-card{position:relative;padding:22px;border:1px solid rgba(255,255,255,.92);border-radius:25px;background:rgba(255,255,255,.82);box-shadow:0 16px 40px rgba(73,55,108,.09);backdrop-filter:blur(14px);transition:.2s ease}
     .region-card:hover{transform:translateY(-2px);box-shadow:0 20px 46px rgba(73,55,108,.13)}
@@ -2022,7 +2026,7 @@ export function dashboardHtml() { return `<!doctype html>
     .log-list{display:grid;gap:11px}.log-row{padding:16px;border:1px solid var(--line);border-radius:18px;background:#fff}.log-main{display:grid;grid-template-columns:minmax(105px,.8fr) minmax(115px,.9fr) minmax(100px,.8fr) minmax(0,2.5fr);gap:13px;align-items:center}.log-cell small{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.log-cell strong{display:block;margin-top:2px;font-size:13px;overflow-wrap:anywhere}.status-pill{display:inline-flex!important;width:max-content;padding:5px 9px;border-radius:999px}.status-passed{color:#167b59;background:#e7f7f0}.status-silent{color:#756b85;background:#f1eef5}.status-fallback{color:#a86618;background:#fff2dc}.status-error{color:#ae3c57;background:#ffe8ee}.status-queued{color:#6652a2;background:#eee9ff}
     .log-facts{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}.fact{padding:5px 8px;border-radius:9px;background:#f8f5fb;color:#5f5770;font-size:11px}.fact.yes{color:#167b59;background:#eaf8f2}.fact.no{color:#ad4059;background:#fff0f3}.ocr-detail{margin-top:11px;color:var(--muted);font-size:12px}.ocr-detail summary{cursor:pointer;font-weight:700;color:#6e518e}.ocr-text{margin:8px 0 0;padding:11px;border-radius:11px;background:#f8f6fb;white-space:pre-wrap;overflow-wrap:anywhere}.empty-logs{text-align:center;padding:44px;color:var(--muted)}
     @media(max-width:960px){.ocr-usage-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid,.ocr-usage-grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.log-toolbar{align-items:stretch;flex-direction:column}.log-actions{display:grid;grid-template-columns:1fr 1fr}.refresh-logs,.requeue-stuck{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}.usage-card{min-width:100%}.webhook-row{align-items:stretch;flex-direction:column}.copy-webhook{min-height:40px}}
+    @media(max-width:760px){.shell{width:min(100% - 20px,1180px);padding-top:16px}.hero{padding:23px;border-radius:24px}.hero:after{font-size:80px}.summary{grid-template-columns:1fr}.grid,.ocr-usage-grid{grid-template-columns:1fr}.region-card:last-child:nth-child(odd){grid-column:auto}.section-head{align-items:start;flex-direction:column}.secure-note{align-self:flex-start}.view-tabs{margin-top:14px}.view-tab{flex:1}.log-toolbar{align-items:stretch;flex-direction:column}.log-actions{display:grid;grid-template-columns:1fr 1fr}.refresh-logs,.requeue-stuck{width:100%}.log-main{grid-template-columns:1fr 1fr}.log-cell.reason{grid-column:1/-1}.usage-card{min-width:100%}.webhook-row{align-items:stretch;flex-direction:column}.copy-webhook{min-height:40px}}
   </style>
 </head>
 <body>
@@ -2035,15 +2039,23 @@ export function dashboardHtml() { return `<!doctype html>
         <div class="summary-item"><span class="summary-value" id="ready-count">—</span><span class="summary-label">ตั้งค่าครบพร้อมใช้</span></div>
       </div>
     </section>
-    <div class="section-head"><div><h2>ตั้งค่าระบบแต่ละภูมิภาค</h2><p>กรอกเฉพาะค่าที่ต้องการเปลี่ยน ค่าเดิมจะไม่ถูกแสดงกลับมา</p></div><div class="secure-note">🔒 Secret เข้ารหัสแล้ว</div></div>
-    <section class="grid" id="app"><div class="loading"><span class="spinner"></span><br>กำลังโหลดข้อมูล...</div></section>
-    <div class="section-head"><div><h2>การใช้งาน OCR วันนี้</h2><p>ตัวนับแยก PaddleOCR, OCR.space และ Workers AI ของแต่ละภูมิภาค</p></div><div class="secure-note">PaddleOCR เป็นตัวหลัก · OCR.space เป็นระบบสำรอง</div></div>
-    <section class="ocr-usage-grid" id="ocr-usage-grid"><div class="loading"><span class="spinner"></span><br>กำลังโหลดตัวนับ...</div></section>
-    <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">กดรีเฟรชเมื่อต้องการข้อมูลล่าสุด</div></div>
-    <section class="log-panel">
-      <div class="log-toolbar"><div class="log-tabs" id="log-tabs"></div><div class="log-actions"><button class="requeue-stuck" id="requeue-stuck">กู้รายการค้าง</button><button class="refresh-logs" id="refresh-logs">รีเฟรช Log</button></div></div>
-      <div class="usage-summary" id="usage-summary"></div>
-      <div class="log-list" id="log-list"><div class="empty-logs"><span class="spinner"></span><br>กำลังโหลด Log...</div></div>
+    <nav class="view-tabs" aria-label="เมนู Control">
+      <button class="view-tab active" type="button" data-view="overview" aria-selected="true">ภาพรวม OCR</button>
+      <button class="view-tab" type="button" data-view="settings" aria-selected="false">ตั้งค่า API</button>
+    </nav>
+    <section class="control-view" id="overview-view">
+      <div class="section-head"><div><h2>การใช้งาน OCR วันนี้</h2><p>ตัวนับแยก PaddleOCR, OCR.space และ Workers AI ของแต่ละภูมิภาค</p></div><div class="secure-note">PaddleOCR เป็นตัวหลัก · OCR.space เป็นระบบสำรอง</div></div>
+      <section class="ocr-usage-grid" id="ocr-usage-grid"><div class="loading"><span class="spinner"></span><br>กำลังโหลดตัวนับ...</div></section>
+      <div class="section-head"><div><h2>ประวัติการตรวจ OCR</h2><p>แสดง 50 รายการล่าสุดของแต่ละภาค และเก็บข้อมูลย้อนหลัง 30 วัน</p></div><div class="secure-note">กดรีเฟรชเมื่อต้องการข้อมูลล่าสุด</div></div>
+      <section class="log-panel">
+        <div class="log-toolbar"><div class="log-tabs" id="log-tabs"></div><div class="log-actions"><button class="requeue-stuck" id="requeue-stuck">กู้รายการค้าง</button><button class="refresh-logs" id="refresh-logs">รีเฟรช Log</button></div></div>
+        <div class="usage-summary" id="usage-summary"></div>
+        <div class="log-list" id="log-list"><div class="empty-logs"><span class="spinner"></span><br>กำลังโหลด Log...</div></div>
+      </section>
+    </section>
+    <section class="control-view" id="settings-view" hidden>
+      <div class="section-head"><div><h2>ตั้งค่า API และภูมิภาค</h2><p>กรอกเฉพาะค่าที่ต้องการเปลี่ยน ค่าเดิมจะไม่ถูกแสดงกลับมา</p></div><div class="secure-note">🔒 Secret เข้ารหัสแล้ว</div></div>
+      <section class="grid" id="app"><div class="loading"><span class="spinner"></span><br>กำลังโหลดข้อมูล...</div></section>
     </section>
   </main>
   <div class="toast" id="toast"></div>
@@ -2055,6 +2067,8 @@ export function dashboardHtml() { return `<!doctype html>
     const logTabs=document.querySelector('#log-tabs');
     const usageSummary=document.querySelector('#usage-summary');
     const ocrUsageGrid=document.querySelector('#ocr-usage-grid');
+    const viewTabs=document.querySelectorAll('[data-view]');
+    const controlViews=document.querySelectorAll('.control-view');
     let activeLogRegion='north';
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
     function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
@@ -2115,6 +2129,11 @@ export function dashboardHtml() { return `<!doctype html>
       const response=await fetch('/admin/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
       if(response.ok){notify('บันทึก '+meta[region].name+' เรียบร้อยแล้ว');await load()}else{let message='บันทึกไม่สำเร็จ (HTTP '+response.status+')';try{const result=await response.json();if(result&&result.error)message=result.error}catch{}notify(message,true);button.disabled=false;button.textContent='บันทึก '+meta[region].name}
     }
+    viewTabs.forEach(button=>button.addEventListener('click',()=>{
+      const view=button.dataset.view;
+      viewTabs.forEach(tab=>{const active=tab===button;tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active))});
+      controlViews.forEach(panel=>{panel.hidden=panel.id!==view+'-view'});
+    }));
     function renderLogs(items){
       if(!items.length){logList.innerHTML='<div class="empty-logs">ยังไม่มีประวัติการตรวจของ '+meta[activeLogRegion].name+'</div>';return}
       logList.innerHTML=items.map(item=>{
