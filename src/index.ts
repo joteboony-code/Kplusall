@@ -45,6 +45,7 @@ type OcrLogRow = {
   image_set_total: number | null;
   reply_token_age_ms: number | null;
   reply_token_source_slip_id: string | null;
+  evidence_json: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -101,6 +102,11 @@ type SlipProcessRow = {
   result_sent_at: string | null;
   paddle_job_id?: string | null;
   paddle_poll_count?: number;
+  image_set_id?: string | null;
+  image_set_index?: number | null;
+  image_set_total?: number | null;
+  queue_claimed_at?: string | null;
+  evidence_json?: string | null;
 };
 const REGIONS: Region[] = ["north", "isan", "south", "central", "bangkok"];
 const WEBHOOK_REGION_ALIASES: Record<string, Region> = {
@@ -337,6 +343,36 @@ async function enqueueOcrJobSafely(
     await auditQueueDeferral(env, "ocr-jobs", `${message.id}: ${detail}`, region);
     return false;
   }
+}
+
+const OCR_QUEUE_CLAIM_LEASE_MINUTES = 2;
+
+async function claimOcrQueueSlot(env: Pick<Env, "DB">, id: string): Promise<boolean> {
+  const result = await env.DB.prepare(`UPDATE slip_jobs
+      SET queue_claimed_at=CURRENT_TIMESTAMP
+      WHERE id=? AND status IN ('queued','paddle_pending','passed','failed')
+        AND (queue_claimed_at IS NULL OR queue_claimed_at<datetime('now',?))`)
+    .bind(id, `-${OCR_QUEUE_CLAIM_LEASE_MINUTES} minutes`)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
+async function releaseOcrQueueSlot(env: Pick<Env, "DB">, id: string): Promise<void> {
+  await env.DB.prepare("UPDATE slip_jobs SET queue_claimed_at=NULL WHERE id=?")
+    .bind(id)
+    .run();
+}
+
+async function enqueueOcrJobIfNeeded(
+  env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
+  message: OcrQueueMessage,
+  region: Region,
+  options?: QueueSendOptions,
+): Promise<boolean> {
+  if (!(await claimOcrQueueSlot(env, message.id))) return false;
+  const queued = await enqueueOcrJobSafely(env, message, region, options);
+  if (!queued) await releaseOcrQueueSlot(env, message.id);
+  return queued;
 }
 
 type PendingResultState = {
@@ -659,6 +695,57 @@ export function imageSetMetadata(event: LineEvent) {
   };
 }
 
+async function lookupImageSetParent(
+  env: Pick<Env, "DB">,
+  region: Region,
+  scope: ReturnType<typeof lineScopeFromEvent> & {},
+  imageSetId: string,
+): Promise<ActiveUserJob | null> {
+  return env.DB.prepare(`SELECT u.id,u.job_number
+      FROM image_set_bindings b
+      JOIN user_jobs u ON u.id=b.parent_job_id
+      WHERE b.region=? AND b.conversation_id=? AND b.sender_user_id=?
+        AND b.image_set_id=? AND b.expires_at>CURRENT_TIMESTAMP
+        AND u.result_sent_at IS NULL AND u.expires_at>CURRENT_TIMESTAMP
+      LIMIT 1`)
+    .bind(region, scope.conversationId, scope.senderId, imageSetId)
+    .first<ActiveUserJob>();
+}
+
+async function bindImageSetParent(
+  env: Pick<Env, "DB">,
+  region: Region,
+  scope: ReturnType<typeof lineScopeFromEvent> & {},
+  imageSetId: string,
+  parent: ActiveUserJob,
+): Promise<ActiveUserJob | null> {
+  await env.DB.prepare(`DELETE FROM image_set_bindings
+      WHERE region=? AND conversation_id=? AND sender_user_id=?
+        AND image_set_id=? AND expires_at<=CURRENT_TIMESTAMP`)
+    .bind(region, scope.conversationId, scope.senderId, imageSetId)
+    .run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO image_set_bindings(
+      region,conversation_id,sender_user_id,image_set_id,parent_job_id,job_number,expires_at
+    ) VALUES(?,?,?,?,?,?,datetime('now','+30 minutes'))`)
+    .bind(
+      region,
+      scope.conversationId,
+      scope.senderId,
+      imageSetId,
+      parent.id,
+      parent.job_number,
+    )
+    .run();
+  return lookupImageSetParent(env, region, scope, imageSetId);
+}
+
+async function purgeExpiredImageSetBindings(env: Pick<Env, "DB">): Promise<number> {
+  const result = await env.DB.prepare(
+    "DELETE FROM image_set_bindings WHERE expires_at<=CURRENT_TIMESTAMP",
+  ).run();
+  return result.meta.changes ?? 0;
+}
+
 export function splitLineWebhookEvents(events: LineEvent[]) {
   return {
     referenceEvents: events.filter(
@@ -757,6 +844,10 @@ export async function processWebhookEvents(
     if (event.message?.type !== "image" || !event.message.id || !event.replyToken) continue;
     const hasEventTimestamp = typeof event.timestamp === "number" &&
       Number.isFinite(event.timestamp) && event.timestamp > 0;
+    const imageSet = imageSetMetadata(event);
+    let parent = imageSet.id
+      ? await lookupImageSetParent(env, region, scope, imageSet.id)
+      : null;
     const parentQuery = hasEventTimestamp
       ? `SELECT id,job_number FROM user_jobs
           WHERE region=? AND line_conversation_id=? AND line_sender_id=?
@@ -767,11 +858,22 @@ export async function processWebhookEvents(
           WHERE region=? AND line_conversation_id=? AND line_sender_id=?
             AND expires_at>CURRENT_TIMESTAMP
           ORDER BY reference_set_at DESC,rowid DESC LIMIT 1`;
-    const parent = await env.DB.prepare(parentQuery)
-      .bind(...(hasEventTimestamp
-        ? [region, scope.conversationId, userId, event.timestamp]
-        : [region, scope.conversationId, userId]))
-      .first<ActiveUserJob>();
+    if (!parent) {
+      parent = await env.DB.prepare(parentQuery)
+        .bind(...(hasEventTimestamp
+          ? [region, scope.conversationId, userId, event.timestamp]
+          : [region, scope.conversationId, userId]))
+        .first<ActiveUserJob>();
+      if (parent && imageSet.id) {
+        parent = await bindImageSetParent(env, region, scope, imageSet.id, parent);
+        await audit(
+          env,
+          "image_set_tid_bound",
+          `${imageSet.id}: ${parent?.job_number ?? "unknown"}`,
+          region,
+        );
+      }
+    }
     if (!parent) {
       await audit(env, "image_ignored_no_active_job", event.message.id, region);
       continue;
@@ -779,7 +881,6 @@ export async function processWebhookEvents(
     const messageId = event.message.id;
     const id = crypto.randomUUID();
     const r2Key = `${region}/${today()}/${id}.jpg`;
-    const imageSet = imageSetMetadata(event);
     const replyTokenReceivedAtMs = receivedAtMs;
     const inserted = await env.DB.prepare(`INSERT INTO slip_jobs(
         id,region,parent_job_id,line_message_id,line_user_id,r2_key,
@@ -823,7 +924,7 @@ export async function processWebhookEvents(
         (!duplicate.result_sent_at &&
           (duplicate.status === "passed" || duplicate.status === "failed"))
       )) {
-        await enqueueOcrJobSafely(env, { id: duplicate.id, region }, region);
+        await enqueueOcrJobIfNeeded(env, { id: duplicate.id, region }, region);
       }
       await audit(
         env,
@@ -833,7 +934,7 @@ export async function processWebhookEvents(
       );
       continue;
     }
-    await enqueueOcrJobSafely(env, { id, region }, region);
+    await enqueueOcrJobIfNeeded(env, { id, region }, region);
     await audit(env, "image_queued", `${parent.job_number}${imageSet.total ? ` รูป ${imageSet.index ?? "?"}/${imageSet.total}` : ""}`, region);
   }
 }
@@ -1186,6 +1287,29 @@ async function runWorkersAiVision(env: Env, imageBytes: ArrayBuffer) {
   return analyzeWorkersAiTranscription(response);
 }
 
+function compactEvidence(
+  row: Pick<SlipProcessRow, "job_number" | "image_set_id" | "image_set_index" | "image_set_total">,
+  analysis: OcrAnalysis,
+  provider: string,
+) {
+  return JSON.stringify({
+    tid: row.job_number,
+    result: analysis.result,
+    provider,
+    kplus: analysis.foundKplus,
+    settlement: analysis.foundSettlement,
+    matchedAmount: analysis.matchedAmount,
+    amounts: analysis.detectedAmounts.slice(0, 8),
+    imageSet: row.image_set_id
+      ? {
+          id: row.image_set_id,
+          index: row.image_set_index ?? null,
+          total: row.image_set_total ?? null,
+        }
+      : null,
+  }).slice(0, 2_000);
+}
+
 async function completeImageAnalysis(
   env: Env,
   row: SlipProcessRow,
@@ -1247,6 +1371,7 @@ async function completeImageAnalysis(
       ai_found_settlement=?,
       ai_detected_amounts=?,
       ai_confident=?,
+      evidence_json=?,
       updated_at=CURRENT_TIMESTAMP
     WHERE id=?`)
     .bind(
@@ -1269,6 +1394,7 @@ async function completeImageAnalysis(
       aiAnalysis ? (aiAnalysis.foundSettlement ? 1 : 0) : null,
       aiAnalysis ? JSON.stringify(aiAnalysis.detectedAmounts) : null,
       aiAnalysis ? (aiAnalysis.confident ? 1 : 0) : null,
+      compactEvidence(row, finalAnalysis, provider),
       row.id
     ).run();
   await deleteCachedImage(env, row);
@@ -1899,7 +2025,8 @@ async function cleanupOldLogs(env: Env) {
   const results = await env.DB.batch([
     env.DB.prepare("DELETE FROM audit_logs WHERE created_at < datetime('now','-30 days')"),
     env.DB.prepare("DELETE FROM slip_jobs WHERE created_at < datetime('now','-30 days')"),
-    env.DB.prepare("DELETE FROM user_jobs WHERE updated_at < datetime('now','-30 days') AND NOT EXISTS (SELECT 1 FROM slip_jobs WHERE slip_jobs.parent_job_id=user_jobs.id)")
+    env.DB.prepare("DELETE FROM user_jobs WHERE updated_at < datetime('now','-30 days') AND NOT EXISTS (SELECT 1 FROM slip_jobs WHERE slip_jobs.parent_job_id=user_jobs.id)"),
+    env.DB.prepare("DELETE FROM image_set_bindings WHERE expires_at<=CURRENT_TIMESTAMP")
   ]);
   console.log(JSON.stringify({ event: "retention_cleanup", retentionDays: 30, changes: results.map((result) => result.meta.changes ?? 0) }));
 }
@@ -2140,12 +2267,13 @@ export function dashboardHtml() { return `<!doctype html>
         const status=statusInfo(item);const amounts=item.matchedAmount||((item.detectedAmounts||[]).join(', '))||'ไม่พบ';
         const ocrDetail=item.ocrExcerpt?'<details class="ocr-detail"><summary>ดูข้อความ OCR บางส่วน</summary><pre class="ocr-text">'+escapeHtml(item.ocrExcerpt)+'</pre></details>':'';
         const aiDetail=item.aiResponseExcerpt?'<details class="ocr-detail"><summary>ดูคำตอบ Workers AI Vision</summary><pre class="ocr-text">'+escapeHtml(item.aiResponseExcerpt)+'</pre></details>':'';
+        const evidenceDetail=item.evidenceJson?'<details class="ocr-detail"><summary>ดูหลักฐานแบบย่อ</summary><pre class="ocr-text">'+escapeHtml(item.evidenceJson)+'</pre></details>':'';
         const imageSet=item.imageSetTotal?'<span class="fact">รูปในชุด: '+escapeHtml((item.imageSetIndex??'?')+'/'+item.imageSetTotal)+'</span>':'';
         const ocrAmounts=(item.ocrspaceDetectedAmounts||[]).join(', ')||'ไม่พบ';
         const ocrKey=item.ocrKeyRegion?'<span class="fact">OCR Key: '+escapeHtml(meta[item.ocrKeyRegion]?.name||item.ocrKeyRegion)+'</span>':'';
         const replyTokenAge=item.replyTokenAgeMs===null||item.replyTokenAgeMs===undefined?'':'<span class="fact '+(item.replyTokenAgeMs>=50000?'no':'yes')+'">Reply Token: '+escapeHtml((item.replyTokenAgeMs/1000).toFixed(1))+' วินาที</span>';
         const aiFacts=item.aiProvider?fact('AI KPLUS/K+',item.aiFoundKplus)+fact('AI SETTLEMENT',item.aiFoundSettlement)+'<span class="fact">AI ยอด: '+escapeHtml((item.aiDetectedAmounts||[]).join(', ')||'ไม่พบ')+'</span><span class="fact">AI มั่นใจ: '+(item.aiConfident?'ใช่':'ไม่')+'</span>':'';
-        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(providerName(item.provider))+'</span>'+ocrKey+replyTokenAge+imageSet+fact('OCR KPLUS/K+',item.ocrspaceFoundKplus)+fact('OCR SETTLEMENT',item.ocrspaceFoundSettlement)+'<span class="fact">OCR ยอด: '+escapeHtml(ocrAmounts)+'</span>'+aiFacts+'<span class="fact">ผลสุดท้าย ยอด: '+escapeHtml(amounts)+'</span></div>'+ocrDetail+aiDetail+'</article>'
+        return '<article class="log-row"><div class="log-main"><div class="log-cell"><small>เวลา</small><strong>'+escapeHtml(formatTime(item.updatedAt))+'</strong></div><div class="log-cell"><small>เลขงาน</small><strong>'+escapeHtml(item.jobNumber)+'</strong></div><div class="log-cell"><small>ผล</small><strong class="status-pill '+status[1]+'">'+escapeHtml(status[0])+'</strong></div><div class="log-cell reason"><small>เหตุผล</small><strong>'+escapeHtml(item.reason||'กำลังรอประมวลผล')+'</strong></div></div><div class="log-facts"><span class="fact">ตรวจด้วย: '+escapeHtml(providerName(item.provider))+'</span>'+ocrKey+replyTokenAge+imageSet+fact('OCR KPLUS/K+',item.ocrspaceFoundKplus)+fact('OCR SETTLEMENT',item.ocrspaceFoundSettlement)+'<span class="fact">OCR ยอด: '+escapeHtml(ocrAmounts)+'</span>'+aiFacts+'<span class="fact">ผลสุดท้าย ยอด: '+escapeHtml(amounts)+'</span></div>'+evidenceDetail+ocrDetail+aiDetail+'</article>'
       }).join('')
     }
     async function loadLogs(){
@@ -2214,16 +2342,23 @@ async function requeueStuckJobs(env: Env) {
     if (row.status === "queued" && row.ocr_provider?.includes("ocrspace")) {
       queued = await enqueueOcrSpaceFallback(env, row, row.ocr_provider.includes("paddleocr"));
     } else {
-      queued = await enqueueOcrJobSafely(env, row.status === "paddle_pending" && row.paddle_job_id
-        ? {
+      if (row.status === "paddle_pending" && row.paddle_job_id) {
+        queued = await enqueueOcrJobSafely(env, {
           id: row.id,
           region: row.region,
           phase: "paddle_poll",
           paddleJobId: row.paddle_job_id,
           paddlePollCount: row.paddle_poll_count,
           paddleAttempted: true
-        } satisfies OcrQueueMessage
-        : { id: row.id, region: row.region } satisfies OcrQueueMessage, row.region);
+        } satisfies OcrQueueMessage, row.region);
+      } else {
+        await releaseOcrQueueSlot(env, row.id);
+        queued = await enqueueOcrJobIfNeeded(
+          env,
+          { id: row.id, region: row.region },
+          row.region,
+        );
+      }
     }
     if (!queued) continue;
     await env.DB.prepare("UPDATE slip_jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('queued','paddle_pending')")
@@ -2283,7 +2418,7 @@ async function admin(request: Request, env: Env, url: URL) {
         s.ai_provider,substr(s.ai_response,1,500) AS ai_response_excerpt,
         s.ai_found_kplus,s.ai_found_settlement,s.ai_detected_amounts,s.ai_confident,
         s.image_set_id,s.image_set_index,s.image_set_total,
-        s.reply_token_age_ms,s.reply_token_source_slip_id,
+        s.reply_token_age_ms,s.reply_token_source_slip_id,s.evidence_json,
         s.created_at,s.updated_at
       FROM slip_jobs s
       JOIN user_jobs u ON u.id=s.parent_job_id
@@ -2320,6 +2455,7 @@ async function admin(request: Request, env: Env, url: URL) {
       imageSetTotal: row.image_set_total,
       replyTokenAgeMs: row.reply_token_age_ms,
       replyTokenSourceSlipId: row.reply_token_source_slip_id,
+      evidenceJson: row.evidence_json,
       createdAt: row.created_at,
       updatedAt: row.updated_at
     })));
