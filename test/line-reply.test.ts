@@ -69,12 +69,12 @@ describe("LINE inspection delivery", () => {
     const payload = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
     expect(payload.messages[0].text).toBe(
       "TID: 87654321\n" +
-      "❌ ตรวจสอบไม่ผ่าน: สลิป KPLUS\n" +
+      "❌ ตรวจสอบไม่พบยอด 1.22: สลิป KPLUS\n" +
       "ยอดที่อ่านได้: 9.99 บาท\n" +
       "สาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\n" +
       "หาก Test ผ่าน Link POS อย่าลืมลง Remark"
     );
-    expect(payload.messages[0].text).toContain("ตรวจสอบไม่ผ่าน");
+    expect(payload.messages[0].text).toContain("ตรวจสอบไม่พบยอด 1.22");
     expect(payload.messages[0].text).toContain("9.99");
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain("/push");
   });

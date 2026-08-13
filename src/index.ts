@@ -438,7 +438,7 @@ function inspectionResultMessage(row: SlipProcessRow, result: "passed" | "failed
   const jobText = `TID: ${row.job_number}`;
   const resultText = result === "passed"
     ? `✅ ตรวจสอบผ่าน: พบสลิป KPLUS\nยอด ${row.matched_amount ?? "1.22"} บาท ข้อมูลถูกต้อง`
-    : `❌ ตรวจสอบไม่ผ่าน: สลิป KPLUS\nยอดที่อ่านได้: ${detectedAmountText}\nสาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\nหาก Test ผ่าน Link POS อย่าลืมลง Remark`;
+    : `❌ ตรวจสอบไม่พบยอด 1.22: สลิป KPLUS\nยอดที่อ่านได้: ${detectedAmountText}\nสาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\nหาก Test ผ่าน Link POS อย่าลืมลง Remark`;
   const quote = row.line_quote_token ? { quoteToken: row.line_quote_token } : {};
   if ((row.line_source_type === "group" || row.line_source_type === "room") && row.line_user_id) {
     return {
