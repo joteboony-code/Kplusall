@@ -124,6 +124,8 @@ const PADDLEOCR_PROVIDER = "paddleocr";
 const PADDLEOCR_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
 export const DEFAULT_PADDLEOCR_MODEL = "PaddleOCR-VL-1.6";
 export const PADDLEOCR_POLL_DELAY_SECONDS = 3;
+/** Fast PaddleOCR jobs are polled inline to avoid two extra Queue messages. */
+export const PADDLEOCR_INLINE_POLLS = 2;
 export const MAX_PADDLEOCR_POLLS = 3;
 export const VISIBLE_TEXT_PROMPT = `Transcribe only text that is clearly visible in this image.
 Preserve line breaks, decimal points, and minus signs exactly as printed.
@@ -343,28 +345,28 @@ type PendingResultState = {
   pendingCount: number;
   failedCount: number;
   passedCount: number;
+  firstFailedAt?: string | null;
   latestCreatedAt: string | null;
 };
 
 export type PendingResultDecision = "wait" | "passed" | "failed" | "silent";
 
 /**
- * A wrong amount on one image is not final while more images may still arrive.
- * A matching image always wins immediately; otherwise a failed result is only
- * delivered after the image set is complete or the quiet window has elapsed.
+ * A wrong amount on one image is not final while an OCR result is still
+ * pending. A matching image always wins immediately; otherwise a failed result
+ * is delivered as soon as all received images finish, with the 45-second
+ * timeout acting only as a safety limit for a stuck OCR result.
  */
 export function pendingResultDecision(
   state: PendingResultState,
   nowMs = Date.now()
 ): PendingResultDecision {
   if (state.passedCount > 0) return "passed";
-  if (state.pendingCount > 0) return "wait";
-  if (state.expectedImageCount > 0 && state.imageCount < state.expectedImageCount) {
-    return "wait";
-  }
-  if (state.expectedImageCount <= 0 && state.latestCreatedAt) {
-    const createdAtMs = Date.parse(`${state.latestCreatedAt.replace(" ", "T")}Z`);
-    if (Number.isFinite(createdAtMs) && nowMs - createdAtMs < FAILED_RESULT_WAIT_MS) {
+  if (state.pendingCount > 0) {
+    const failedAtMs = state.firstFailedAt
+      ? Date.parse(`${state.firstFailedAt.replace(" ", "T")}Z`)
+      : Number.NaN;
+    if (!Number.isFinite(failedAtMs) || nowMs - failedAtMs < FAILED_RESULT_WAIT_MS) {
       return "wait";
     }
   }
@@ -385,17 +387,24 @@ async function enqueuePendingResultFinalizer(
 
 async function deferFailedResult(
   env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
-  row: Pick<SlipProcessRow, "id" | "parent_job_id" | "region">
+  row: Pick<SlipProcessRow, "id" | "parent_job_id" | "region" | "job_number">,
+  lineToken: string,
 ) {
-  // Only the first wrong-amount image schedules the delayed finalizer. Later
-  // wrong images are included in the same parent job and do not multiply queue
-  // writes. The scheduled recovery path also retries this if the queue is full.
+  // Only the first wrong-amount image schedules the delayed finalizer when an
+  // OCR result is still pending. Later wrong images share the same TID state
+  // and do not multiply queue writes. The scheduled recovery path also retries
+  // this if the queue is full.
   const claimed = await env.DB.prepare(`UPDATE user_jobs
     SET status='pending_failed', updated_at=CURRENT_TIMESTAMP
     WHERE id=? AND result_sent_at IS NULL AND status='collecting'`)
     .bind(row.parent_job_id)
     .run();
   if ((claimed.meta.changes ?? 0) !== 1) return;
+  const state = await pendingResultState(env, row.parent_job_id);
+  if (state && pendingResultDecision(state) !== "wait") {
+    await finalizePendingResult(env, row, lineToken);
+    return;
+  }
   await enqueuePendingResultFinalizer(env, row);
 }
 
@@ -406,6 +415,8 @@ async function pendingResultState(env: Pick<Env, "DB">, parentJobId: string) {
       COALESCE(SUM(CASE WHEN s.status IN ('queued','paddle_pending') THEN 1 ELSE 0 END),0) AS "pendingCount",
       COALESCE(SUM(CASE WHEN s.status='failed' OR s.result='failed' THEN 1 ELSE 0 END),0) AS "failedCount",
       COALESCE(SUM(CASE WHEN s.status='passed' OR s.result='passed' THEN 1 ELSE 0 END),0) AS "passedCount",
+      MIN(CASE WHEN s.status='failed' OR s.result='failed'
+        THEN COALESCE(s.updated_at,s.created_at) END) AS "firstFailedAt",
       MAX(s.created_at) AS "latestCreatedAt"
     FROM slip_jobs s
     WHERE s.parent_job_id=?`)
@@ -425,7 +436,11 @@ async function loadDecisiveRow(env: Pick<Env, "DB">, parentJobId: string, result
     .first<SlipProcessRow>();
 }
 
-async function finalizePendingResult(env: Env, row: SlipProcessRow, lineToken: string) {
+async function finalizePendingResult(
+  env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
+  row: Pick<SlipProcessRow, "id" | "parent_job_id" | "region" | "job_number">,
+  lineToken: string,
+) {
   const parent = await env.DB.prepare(`SELECT id,result_sent_at,status,expires_at
     FROM user_jobs WHERE id=?`)
     .bind(row.parent_job_id)
@@ -442,11 +457,11 @@ async function finalizePendingResult(env: Env, row: SlipProcessRow, lineToken: s
   if (!state) return;
   const decision = pendingResultDecision(state);
   if (decision === "wait") {
-    const latestMs = state.latestCreatedAt
-      ? Date.parse(`${state.latestCreatedAt.replace(" ", "T")}Z`)
+    const firstFailedMs = state.firstFailedAt
+      ? Date.parse(`${state.firstFailedAt.replace(" ", "T")}Z`)
       : Number.NaN;
-    const remainingSeconds = Number.isFinite(latestMs)
-      ? Math.max(5, Math.ceil((FAILED_RESULT_WAIT_MS - (Date.now() - latestMs)) / 1000))
+    const remainingSeconds = Number.isFinite(firstFailedMs)
+      ? Math.max(5, Math.ceil((FAILED_RESULT_WAIT_MS - (Date.now() - firstFailedMs)) / 1000))
       : 15;
     await enqueueOcrJobSafely(
       env,
@@ -472,6 +487,21 @@ async function finalizePendingResult(env: Env, row: SlipProcessRow, lineToken: s
   // the original no-evidence rule and allowing a later image in the same TID.
   await env.DB.prepare("UPDATE user_jobs SET status='collecting',updated_at=CURRENT_TIMESTAMP WHERE id=? AND result_sent_at IS NULL")
     .bind(row.parent_job_id).run();
+}
+
+async function settlePendingResultIfReady(
+  env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
+  row: Pick<SlipProcessRow, "id" | "parent_job_id" | "region" | "job_number">,
+  lineToken: string,
+) {
+  const parent = await env.DB.prepare(`SELECT status,result_sent_at
+    FROM user_jobs WHERE id=?`)
+    .bind(row.parent_job_id)
+    .first<{ status: string; result_sent_at: string | null }>();
+  if (!parent || parent.result_sent_at || parent.status !== "pending_failed") return;
+  const state = await pendingResultState(env, row.parent_job_id);
+  if (!state || pendingResultDecision(state) === "wait") return;
+  await finalizePendingResult(env, row, lineToken);
 }
 export async function reserveOcrSpaceUsage(env: Pick<Env, "DB">, region: Region) {
   await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,'ocrspace')")
@@ -1239,10 +1269,10 @@ async function completeImageAnalysis(
       // for the remaining images in the same LINE batch.
       await deliverResult(env, row, lineToken, "passed");
     } else {
-      // A wrong amount is only a candidate failure. More images may contain
-      // the correct settlement, so defer the failure until the set is complete
-      // or the sender has been quiet for the configured window.
-      await deferFailedResult(env, row);
+      // A wrong amount is only a candidate failure. More OCR results may still
+      // contain the correct settlement, so defer only while an OCR result is
+      // pending or until the 45-second safety timeout.
+      await deferFailedResult(env, row, lineToken);
     }
   }
   await audit(
@@ -1251,6 +1281,9 @@ async function completeImageAnalysis(
     row.job_number,
     row.region
   );
+  // A later image may be the last pending OCR result. Finalize immediately
+  // once all received results are done instead of waiting for the timer.
+  await settlePendingResultIfReady(env, row, lineToken);
 }
 
 export async function latestReplyToken(db: D1Database, parentJobId: string) {
@@ -1433,6 +1466,76 @@ async function enqueueOcrSpaceFallback(
   }
 }
 
+function waitForPaddlePoll(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, PADDLEOCR_POLL_DELAY_SECONDS * 1000);
+  });
+}
+
+async function pollPaddleInline(
+  env: Env,
+  row: SlipProcessRow,
+  lineToken: string,
+  imageBytes: ArrayBuffer,
+  paddleToken: string,
+  paddleJobId: string,
+): Promise<boolean> {
+  for (let pollCount = 0; pollCount < PADDLEOCR_INLINE_POLLS; pollCount += 1) {
+    const response = await fetch(
+      `${PADDLEOCR_JOB_URL}/${encodeURIComponent(paddleJobId)}`,
+      paddleOcrPollRequest(paddleToken),
+    );
+    const payload = await response.json<any>().catch(() => null);
+    if (!response.ok || payload?.code !== 0) {
+      throw new Error(String(payload?.msg ?? `HTTP ${response.status}`));
+    }
+    const state = payload?.data?.state;
+    if (state === "failed") {
+      throw new Error(String(payload?.data?.errorMsg ?? "PaddleOCR parsing failed"));
+    }
+    if (state === "done") {
+      const jsonUrl = payload?.data?.resultUrl?.jsonUrl;
+      if (typeof jsonUrl !== "string" || !jsonUrl) {
+        throw new Error("PaddleOCR ไม่ส่ง result URL");
+      }
+      const resultResponse = await fetch(jsonUrl, { signal: AbortSignal.timeout(20_000) });
+      if (!resultResponse.ok) {
+        throw new Error(`ดาวน์โหลดผล PaddleOCR ไม่สำเร็จ: HTTP ${resultResponse.status}`);
+      }
+      const text = extractPaddleOcrText(await resultResponse.text());
+      if (!text) throw new Error("PaddleOCR ส่งผลลัพธ์ที่ไม่มีข้อความ");
+      await recordPaddleOcrOutcome(env, row.region, true);
+      await audit(env, "paddleocr_done", `${row.job_number}: ${paddleJobId}`, row.region);
+      await completeImageAnalysis(
+        env,
+        row,
+        lineToken,
+        imageBytes,
+        text,
+        analyzeOcr(text, true),
+        null,
+        false,
+        PADDLEOCR_PROVIDER,
+        "PaddleOCR",
+      );
+      return true;
+    }
+    if (state !== "pending" && state !== "running") {
+      throw new Error(`PaddleOCR สถานะไม่รู้จัก: ${String(state)}`);
+    }
+    const nextPollCount = pollCount + 1;
+    await env.DB.prepare(
+      "UPDATE slip_jobs SET paddle_poll_count=?,decision_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+    ).bind(
+      nextPollCount,
+      `PaddleOCR กำลังประมวลผล (${nextPollCount}/${MAX_PADDLEOCR_POLLS})`,
+      row.id,
+    ).run();
+    if (nextPollCount < PADDLEOCR_INLINE_POLLS) await waitForPaddlePoll();
+  }
+  return false;
+}
+
 async function runOcrSpaceFallback(
   env: Env,
   row: SlipProcessRow,
@@ -1610,7 +1713,7 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
     return;
   }
   if (row.status === "failed" && !row.result_sent_at) {
-    await deferFailedResult(env, row);
+    await deferFailedResult(env, row, c.lineToken);
     return;
   }
   if (row.status !== "queued" && row.status !== "paddle_pending") {
@@ -1670,12 +1773,22 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
           updated_at=CURRENT_TIMESTAMP
         WHERE id=?`)
         .bind(PADDLEOCR_PROVIDER, jobId, row.id).run();
+      if (await pollPaddleInline(
+        env,
+        row,
+        c.lineToken,
+        imageBytes,
+        paddleToken,
+        jobId,
+      )) {
+        return;
+      }
       await enqueueOcrJobSafely(env, {
         id: row.id,
         region: row.region,
         phase: "paddle_poll",
         paddleJobId: jobId,
-        paddlePollCount: 0,
+        paddlePollCount: PADDLEOCR_INLINE_POLLS,
         paddleAttempted: true
       } satisfies OcrQueueMessage, row.region, { delaySeconds: PADDLEOCR_POLL_DELAY_SECONDS });
       await audit(env, "paddleocr_submitted", `${row.job_number}: ${jobId}`, row.region);

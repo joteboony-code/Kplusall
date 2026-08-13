@@ -327,14 +327,39 @@ VOID -THB 1.22`);
     expect(pendingResultDecision({
       imageCount: 1,
       expectedImageCount: 0,
-      pendingCount: 0,
+      pendingCount: 1,
       failedCount: 1,
       passedCount: 0,
+      firstFailedAt: "2026-08-13 12:00:00",
       latestCreatedAt: "2026-08-13 12:00:00"
     }, Date.parse("2026-08-13T12:00:20Z"))).toBe("wait");
   });
 
-  it("fails only after the complete image set has no matching amount", () => {
+  it("does not wait for missing images when every received OCR result is done", () => {
+    expect(pendingResultDecision({
+      imageCount: 1,
+      expectedImageCount: 10,
+      pendingCount: 0,
+      failedCount: 1,
+      passedCount: 0,
+      firstFailedAt: "2026-08-13 12:00:00",
+      latestCreatedAt: "2026-08-13 12:00:00"
+    }, Date.parse("2026-08-13T12:00:01Z"))).toBe("failed");
+  });
+
+  it("stops waiting after the 45-second OCR result timeout", () => {
+    expect(pendingResultDecision({
+      imageCount: 2,
+      expectedImageCount: 2,
+      pendingCount: 1,
+      failedCount: 1,
+      passedCount: 0,
+      firstFailedAt: "2026-08-13 12:00:00",
+      latestCreatedAt: "2026-08-13 12:00:00"
+    }, Date.parse("2026-08-13T12:00:46Z"))).toBe("failed");
+  });
+
+  it("fails once all received OCR results have no matching amount", () => {
     expect(pendingResultDecision({
       imageCount: 3,
       expectedImageCount: 3,
@@ -354,6 +379,18 @@ VOID -THB 1.22`);
       passedCount: 1,
       latestCreatedAt: "2026-08-13 12:00:00"
     })).toBe("passed");
+  });
+
+  it("stays silent when no received image has wrong-amount evidence", () => {
+    expect(pendingResultDecision({
+      imageCount: 10,
+      expectedImageCount: 10,
+      pendingCount: 0,
+      failedCount: 0,
+      passedCount: 0,
+      firstFailedAt: null,
+      latestCreatedAt: "2026-08-13 12:00:00"
+    })).toBe("silent");
   });
 
   it("keeps LINE image-set metadata for every image in a batch", () => {
