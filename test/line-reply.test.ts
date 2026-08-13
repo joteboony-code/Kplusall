@@ -71,7 +71,6 @@ describe("LINE inspection delivery", () => {
       "TID: 87654321\n" +
       "❌ ตรวจสอบไม่พบยอด 1.22: พบ KPLUS + SETTLEMENT แต่ยอดไม่ตรง\n" +
       "ยอดที่อ่านได้: 9.99 บาท\n" +
-      "สาเหตุ: ไม่พบยอด 1.22 หรือ -1.22 บาท\n" +
       "หาก Test ผ่าน Link POS อย่าลืมลง Remark"
     );
     expect(payload.messages[0].text).toContain("ตรวจสอบไม่พบยอด 1.22");
