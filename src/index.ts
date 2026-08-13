@@ -23,6 +23,7 @@ type OcrLogRow = {
   status: string;
   ocr_provider: string | null;
   result: string | null;
+  result_sent_at: string | null;
   found_kplus: number | null;
   found_settlement: number | null;
   matched_amount: string | null;
@@ -53,7 +54,7 @@ type OcrSpaceKeyReservation = { keyRegion: Region; apiKey: string };
 type OcrQueueMessage = {
   id: string;
   region: Region;
-  phase?: "start" | "paddle_poll" | "ocrspace";
+  phase?: "start" | "paddle_poll" | "ocrspace" | "finalize";
   paddleJobId?: string;
   paddlePollCount?: number;
   ocrSpaceAttempt?: number;
@@ -110,6 +111,8 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const JOB_REFERENCE_MINUTES = 30;
 const PASS_CLAIM_MINUTES = 2;
+export const FAILED_RESULT_WAIT_SECONDS = 45;
+const FAILED_RESULT_WAIT_MS = FAILED_RESULT_WAIT_SECONDS * 1000;
 export const REPLY_TOKEN_WARNING_MS = 50_000;
 const OCRSPACE_DAILY_LIMIT = 500;
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -332,6 +335,143 @@ async function enqueueOcrJobSafely(
     await auditQueueDeferral(env, "ocr-jobs", `${message.id}: ${detail}`, region);
     return false;
   }
+}
+
+type PendingResultState = {
+  imageCount: number;
+  expectedImageCount: number;
+  pendingCount: number;
+  failedCount: number;
+  passedCount: number;
+  latestCreatedAt: string | null;
+};
+
+export type PendingResultDecision = "wait" | "passed" | "failed" | "silent";
+
+/**
+ * A wrong amount on one image is not final while more images may still arrive.
+ * A matching image always wins immediately; otherwise a failed result is only
+ * delivered after the image set is complete or the quiet window has elapsed.
+ */
+export function pendingResultDecision(
+  state: PendingResultState,
+  nowMs = Date.now()
+): PendingResultDecision {
+  if (state.passedCount > 0) return "passed";
+  if (state.pendingCount > 0) return "wait";
+  if (state.expectedImageCount > 0 && state.imageCount < state.expectedImageCount) {
+    return "wait";
+  }
+  if (state.expectedImageCount <= 0 && state.latestCreatedAt) {
+    const createdAtMs = Date.parse(`${state.latestCreatedAt.replace(" ", "T")}Z`);
+    if (Number.isFinite(createdAtMs) && nowMs - createdAtMs < FAILED_RESULT_WAIT_MS) {
+      return "wait";
+    }
+  }
+  return state.failedCount > 0 ? "failed" : "silent";
+}
+
+async function enqueuePendingResultFinalizer(
+  env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
+  row: Pick<SlipProcessRow, "id" | "region">
+) {
+  return enqueueOcrJobSafely(
+    env,
+    { id: row.id, region: row.region, phase: "finalize" },
+    row.region,
+    { delaySeconds: FAILED_RESULT_WAIT_SECONDS }
+  );
+}
+
+async function deferFailedResult(
+  env: { DB: D1Database; OCR_JOBS: Pick<Queue<OcrQueueMessage>, "send"> },
+  row: Pick<SlipProcessRow, "id" | "parent_job_id" | "region">
+) {
+  // Only the first wrong-amount image schedules the delayed finalizer. Later
+  // wrong images are included in the same parent job and do not multiply queue
+  // writes. The scheduled recovery path also retries this if the queue is full.
+  const claimed = await env.DB.prepare(`UPDATE user_jobs
+    SET status='pending_failed', updated_at=CURRENT_TIMESTAMP
+    WHERE id=? AND result_sent_at IS NULL AND status='collecting'`)
+    .bind(row.parent_job_id)
+    .run();
+  if ((claimed.meta.changes ?? 0) !== 1) return;
+  await enqueuePendingResultFinalizer(env, row);
+}
+
+async function pendingResultState(env: Pick<Env, "DB">, parentJobId: string) {
+  return env.DB.prepare(`SELECT
+      COUNT(s.id) AS "imageCount",
+      COALESCE(MAX(s.image_set_total),0) AS "expectedImageCount",
+      COALESCE(SUM(CASE WHEN s.status IN ('queued','paddle_pending') THEN 1 ELSE 0 END),0) AS "pendingCount",
+      COALESCE(SUM(CASE WHEN s.status='failed' OR s.result='failed' THEN 1 ELSE 0 END),0) AS "failedCount",
+      COALESCE(SUM(CASE WHEN s.status='passed' OR s.result='passed' THEN 1 ELSE 0 END),0) AS "passedCount",
+      MAX(s.created_at) AS "latestCreatedAt"
+    FROM slip_jobs s
+    WHERE s.parent_job_id=?`)
+    .bind(parentJobId)
+    .first<PendingResultState>();
+}
+
+async function loadDecisiveRow(env: Pick<Env, "DB">, parentJobId: string, result: "passed" | "failed") {
+  return env.DB.prepare(`SELECT
+      s.*,u.job_number,u.line_source_type,u.result_sent_at
+    FROM slip_jobs s
+    JOIN user_jobs u ON u.id=s.parent_job_id
+    WHERE s.parent_job_id=? AND (s.status=? OR s.result=?)
+    ORDER BY s.updated_at DESC,s.created_at DESC,s.rowid DESC
+    LIMIT 1`)
+    .bind(parentJobId, result, result)
+    .first<SlipProcessRow>();
+}
+
+async function finalizePendingResult(env: Env, row: SlipProcessRow, lineToken: string) {
+  const parent = await env.DB.prepare(`SELECT id,result_sent_at,status,expires_at
+    FROM user_jobs WHERE id=?`)
+    .bind(row.parent_job_id)
+    .first<{ id: string; result_sent_at: string | null; status: string; expires_at: string | null }>();
+  if (!parent || parent.result_sent_at) return;
+  if (parent.expires_at && Date.parse(`${parent.expires_at.replace(" ", "T")}Z`) <= Date.now()) {
+    await env.DB.prepare("UPDATE user_jobs SET status='collecting',updated_at=CURRENT_TIMESTAMP WHERE id=? AND result_sent_at IS NULL")
+      .bind(row.parent_job_id).run();
+    await audit(env, "inspection_expired", row.job_number, row.region);
+    return;
+  }
+
+  const state = await pendingResultState(env, row.parent_job_id);
+  if (!state) return;
+  const decision = pendingResultDecision(state);
+  if (decision === "wait") {
+    const latestMs = state.latestCreatedAt
+      ? Date.parse(`${state.latestCreatedAt.replace(" ", "T")}Z`)
+      : Number.NaN;
+    const remainingSeconds = Number.isFinite(latestMs)
+      ? Math.max(5, Math.ceil((FAILED_RESULT_WAIT_MS - (Date.now() - latestMs)) / 1000))
+      : 15;
+    await enqueueOcrJobSafely(
+      env,
+      { id: row.id, region: row.region, phase: "finalize" },
+      row.region,
+      { delaySeconds: Math.min(FAILED_RESULT_WAIT_SECONDS, remainingSeconds) }
+    );
+    return;
+  }
+
+  if (decision === "passed") {
+    const passedRow = await loadDecisiveRow(env, row.parent_job_id, "passed");
+    if (passedRow) await deliverResult(env, passedRow, lineToken, "passed");
+    return;
+  }
+  if (decision === "failed") {
+    const failedRow = await loadDecisiveRow(env, row.parent_job_id, "failed");
+    if (failedRow) await deliverResult(env, failedRow, lineToken, "failed");
+    return;
+  }
+
+  // Images that never contained KPLUS + SETTLEMENT remain silent, preserving
+  // the original no-evidence rule and allowing a later image in the same TID.
+  await env.DB.prepare("UPDATE user_jobs SET status='collecting',updated_at=CURRENT_TIMESTAMP WHERE id=? AND result_sent_at IS NULL")
+    .bind(row.parent_job_id).run();
 }
 export async function reserveOcrSpaceUsage(env: Pick<Env, "DB">, region: Region) {
   await env.DB.prepare("INSERT OR IGNORE INTO daily_usage(usage_date,region,provider) VALUES(?,?,'ocrspace')")
@@ -1094,7 +1234,16 @@ async function completeImageAnalysis(
     row.matched_amount = finalAnalysis.matchedAmount;
     row.detected_amounts = JSON.stringify(finalAnalysis.detectedAmounts);
     row.decision_reason = finalAnalysis.reason;
-    await deliverResult(env, row, lineToken, finalAnalysis.result);
+    if (finalAnalysis.result === "passed") {
+      // A confirmed KPLUS + SETTLEMENT + 1.22 image is decisive. Do not wait
+      // for the remaining images in the same LINE batch.
+      await deliverResult(env, row, lineToken, "passed");
+    } else {
+      // A wrong amount is only a candidate failure. More images may contain
+      // the correct settlement, so defer the failure until the set is complete
+      // or the sender has been quiet for the configured window.
+      await deferFailedResult(env, row);
+    }
   }
   await audit(
     env,
@@ -1451,9 +1600,17 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
   }
   const c = await config(env, data.region);
   if (!c.enabled || !c.lineToken) throw new Error("region configuration unavailable");
-  if ((row.status === "passed" || row.status === "failed") && !row.result_sent_at) {
+  if (data.phase === "finalize") {
+    await finalizePendingResult(env, row, c.lineToken);
+    return;
+  }
+  if (row.status === "passed" && !row.result_sent_at) {
     await deleteCachedImage(env, row);
-    await deliverResult(env, row, c.lineToken, row.status);
+    await deliverResult(env, row, c.lineToken, "passed");
+    return;
+  }
+  if (row.status === "failed" && !row.result_sent_at) {
+    await deferFailedResult(env, row);
     return;
   }
   if (row.status !== "queued" && row.status !== "paddle_pending") {
@@ -1637,6 +1794,30 @@ async function cleanupExpiredImages(env: Env) {
   console.log(JSON.stringify({ event: "r2_daily_cleanup", retentionHours: 24, deleted }));
 }
 
+async function finalizePendingFailedJobs(env: Env) {
+  const parents = await env.DB.prepare(`SELECT id,region
+    FROM user_jobs
+    WHERE status='pending_failed' AND result_sent_at IS NULL
+      AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)
+    ORDER BY updated_at
+    LIMIT 100`)
+    .all<{ id: string; region: Region }>();
+  let checked = 0;
+  for (const parent of parents.results) {
+    const row = await loadDecisiveRow(env, parent.id, "failed") ??
+      await env.DB.prepare(`SELECT s.*,u.job_number,u.line_source_type,u.result_sent_at
+        FROM slip_jobs s JOIN user_jobs u ON u.id=s.parent_job_id
+        WHERE s.parent_job_id=? ORDER BY s.updated_at DESC LIMIT 1`)
+        .bind(parent.id).first<SlipProcessRow>();
+    if (!row) continue;
+    const c = await config(env, parent.region);
+    if (!c.enabled || !c.lineToken) continue;
+    await finalizePendingResult(env, row, c.lineToken);
+    checked++;
+  }
+  return checked;
+}
+
 async function expireStaleQueuedJobs(env: Env): Promise<number> {
   // CURRENT_TIMESTAMP is UTC in D1. +7 hours makes the comparison use the
   // Bangkok calendar boundary (17:00 UTC), so yesterday's work is never
@@ -1753,7 +1934,7 @@ export function dashboardHtml() { return `<!doctype html>
     function notify(text,error=false){const toast=document.querySelector('#toast');toast.textContent=text;toast.className='toast show'+(error?' error':'');setTimeout(()=>toast.className='toast',2600)}
     function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]))}
     function formatTime(value){if(!value)return '—';const date=new Date(String(value).replace(' ','T')+'Z');return Number.isNaN(date.getTime())?value:date.toLocaleString('th-TH',{dateStyle:'short',timeStyle:'short'})}
-    function statusInfo(item){const key=['quota_exhausted','image_too_large','download_error','ocr_error'].includes(item.status)?item.status:(item.result||item.status);return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],silent:['เงียบ','status-silent'],needs_fallback:['รอตรวจสำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],image_too_large:['รูปใหญ่เกินกำหนด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued'],paddle_pending:['PaddleOCR กำลังตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
+    function statusInfo(item){const pendingFailed=item.result==='failed'&&!item.resultSentAt;const key=pendingFailed?'pending_failed':(['quota_exhausted','image_too_large','download_error','ocr_error'].includes(item.status)?item.status:(item.result||item.status));return {passed:['ผ่าน','status-passed'],failed:['ไม่ผ่าน','status-error'],pending_failed:['รอตรวจรูปถัดไป','status-queued'],silent:['เงียบ','status-silent'],needs_fallback:['รอตรวจสำรอง','status-fallback'],quota_exhausted:['OCR ครบโควตา','status-fallback'],ocr_error:['OCR ผิดพลาด','status-error'],download_error:['โหลดรูปผิดพลาด','status-error'],image_too_large:['รูปใหญ่เกินกำหนด','status-error'],suppressed:['หยุดหลังพบผลตรวจ','status-silent'],queued:['รอตรวจ','status-queued'],paddle_pending:['PaddleOCR กำลังตรวจ','status-queued']}[key]||[key||'ไม่ทราบ','status-queued']}
     function fact(label,value){const state=value===null?'':(value?' yes':' no');const text=value===null?'—':(value?'พบ':'ไม่พบ');return '<span class="fact'+state+'">'+label+': '+text+'</span>'}
     function field(region,id,label,placeholder,isSet){return '<label class="field"><span class="field-label"><span>'+label+'</span><span class="field-state">'+(isSet?'ตั้งค่าแล้ว ✓':'ยังไม่ตั้ง')+'</span></span><input type="text" autocomplete="off" id="'+id+'-'+region+'" placeholder="'+placeholder+'"></label>'}
     function providerName(provider){if(!provider)return 'รอระบุ';const names={paddleocr:'PaddleOCR',ocrspace:'OCR.space',workers_ai_vision:'Workers AI Vision'};return provider.split('+').map(part=>names[part]||part).join(' → ')}
@@ -1950,7 +2131,7 @@ async function admin(request: Request, env: Env, url: URL) {
     const region = url.searchParams.get("region") ?? "north";
     if (!isRegion(region)) return json({ error:"invalid region" }, 400);
     const rows = await env.DB.prepare(`SELECT
-        s.id,s.region,u.job_number,s.status,s.ocr_provider,s.result,
+        s.id,s.region,u.job_number,s.status,s.ocr_provider,s.result,u.result_sent_at,
         s.found_kplus,s.found_settlement,s.matched_amount,s.detected_amounts,s.decision_reason,
         substr(s.ocr_text,1,500) AS ocr_excerpt,
         s.ocrspace_found_kplus,s.ocrspace_found_settlement,s.ocrspace_detected_amounts,
@@ -1973,6 +2154,7 @@ async function admin(request: Request, env: Env, url: URL) {
       status: row.status,
       provider: row.ocr_provider,
       result: row.result,
+      resultSentAt: row.result_sent_at,
       foundKplus: row.found_kplus === null ? null : Boolean(row.found_kplus),
       foundSettlement: row.found_settlement === null ? null : Boolean(row.found_settlement),
       matchedAmount: row.matched_amount,
@@ -2067,12 +2249,15 @@ export default {
         const scheduledAt = new Date(controller.scheduledTime);
         const runDailyCleanup = scheduledAt.getUTCHours() === 18 && scheduledAt.getUTCMinutes() === 0;
         const expired = await expireStaleQueuedJobs(env);
-        const tasks: Array<Promise<number | void>> = [requeueStuckJobs(env)];
+        const tasks: Array<Promise<number | void>> = [
+          requeueStuckJobs(env),
+          finalizePendingFailedJobs(env),
+        ];
         if (runDailyCleanup) {
           tasks.push(cleanupOldLogs(env), cleanupExpiredImages(env));
         }
-        const [requeued] = await Promise.all(tasks);
-        console.log(JSON.stringify({ event: "scheduled_recovery_completed", expired, requeued, runDailyCleanup }));
+        const [requeued, finalized] = await Promise.all(tasks);
+        console.log(JSON.stringify({ event: "scheduled_recovery_completed", expired, requeued, finalized, runDailyCleanup }));
       } catch (error) {
         console.error(JSON.stringify({
           event: "scheduled_recovery_failed",

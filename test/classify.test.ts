@@ -12,6 +12,7 @@ import {
   ocrSpaceRequestInit,
   paddleOcrPollRequest,
   paddleOcrSubmitRequest,
+  pendingResultDecision,
   shouldUseWorkersAi,
   VISIBLE_TEXT_PROMPT
 } from "../src/index";
@@ -320,6 +321,39 @@ VOID -THB 1.22`);
     expect(analysis.foundKplus).toBe(true);
     expect(analysis.foundSettlement).toBe(false);
     expect(analysis.reason).toContain("SETTLEMENT");
+  });
+
+  it("waits after a wrong amount so a later image can pass", () => {
+    expect(pendingResultDecision({
+      imageCount: 1,
+      expectedImageCount: 0,
+      pendingCount: 0,
+      failedCount: 1,
+      passedCount: 0,
+      latestCreatedAt: "2026-08-13 12:00:00"
+    }, Date.parse("2026-08-13T12:00:20Z"))).toBe("wait");
+  });
+
+  it("fails only after the complete image set has no matching amount", () => {
+    expect(pendingResultDecision({
+      imageCount: 3,
+      expectedImageCount: 3,
+      pendingCount: 0,
+      failedCount: 2,
+      passedCount: 0,
+      latestCreatedAt: "2026-08-13 12:00:00"
+    }, Date.parse("2026-08-13T12:00:01Z"))).toBe("failed");
+  });
+
+  it("lets a matching image win over earlier wrong-amount images", () => {
+    expect(pendingResultDecision({
+      imageCount: 2,
+      expectedImageCount: 2,
+      pendingCount: 0,
+      failedCount: 1,
+      passedCount: 1,
+      latestCreatedAt: "2026-08-13 12:00:00"
+    })).toBe("passed");
   });
 
   it("keeps LINE image-set metadata for every image in a batch", () => {
