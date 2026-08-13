@@ -41,7 +41,7 @@ describe("LINE inspection delivery", () => {
       }]
     });
     expect(payload.messages[0].text).toContain("{sender}\nTID: 12345678\n");
-    expect(payload.messages[0].text).toContain("✅ ตรวจสอบผ่าน: พบสลิป KPLUS\nยอด 1.22 บาท ข้อมูลถูกต้อง");
+    expect(payload.messages[0].text).toContain("✅ ตรวจสอบผ่าน: พบ KPLUS + SETTLEMENT + ยอด 1.22 บาท ข้อมูลถูกต้อง");
   });
 
   it("returns a failed result through Reply API", async () => {
