@@ -1604,6 +1604,54 @@ async function enqueueOcrSpaceFallback(
   }
 }
 
+/** Keep the provider order deterministic: PaddleOCR -> OCR.space -> Workers AI. */
+async function continueAfterPaddleOcr(
+  env: Env,
+  row: SlipProcessRow,
+  lineToken: string,
+  imageBytes: ArrayBuffer,
+  text: string,
+) {
+  const analysis = analyzeOcr(text, true);
+  if (analysis.result === "passed") {
+    await completeImageAnalysis(
+      env,
+      row,
+      lineToken,
+      imageBytes,
+      text,
+      analysis,
+      null,
+      false,
+      PADDLEOCR_PROVIDER,
+      "PaddleOCR",
+    );
+    return;
+  }
+
+  await env.DB.prepare(`UPDATE slip_jobs SET
+      status='queued',
+      result='needs_fallback',
+      ocr_provider='paddleocr+ocrspace',
+      ocr_text=?,
+      decision_reason=?,
+      updated_at=CURRENT_TIMESTAMP
+    WHERE id=?`)
+    .bind(
+      text.slice(0, 10000),
+      `PaddleOCR ตรวจไม่ครบ (${analysis.reason}) จึงส่งต่อ OCR.space`.slice(0, 1000),
+      row.id,
+    )
+    .run();
+  await audit(
+    env,
+    "paddleocr_forwarded_to_ocrspace",
+    `${row.job_number}: ${analysis.reason}`,
+    row.region,
+  );
+  await enqueueOcrSpaceFallback(env, row, true);
+}
+
 function waitForPaddlePoll(): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, PADDLEOCR_POLL_DELAY_SECONDS * 1000);
@@ -1644,18 +1692,7 @@ async function pollPaddleInline(
       if (!text) throw new Error("PaddleOCR ส่งผลลัพธ์ที่ไม่มีข้อความ");
       await recordPaddleOcrOutcome(env, row.region, true);
       await audit(env, "paddleocr_done", `${row.job_number}: ${paddleJobId}`, row.region);
-      await completeImageAnalysis(
-        env,
-        row,
-        lineToken,
-        imageBytes,
-        text,
-        analyzeOcr(text, true),
-        null,
-        false,
-        PADDLEOCR_PROVIDER,
-        "PaddleOCR",
-      );
+      await continueAfterPaddleOcr(env, row, lineToken, imageBytes, text);
       return true;
     }
     if (state !== "pending" && state !== "running") {
@@ -1989,18 +2026,7 @@ async function processJob(env: Env, data: OcrQueueMessage, attempt = 1) {
     if (!text) throw new Error("PaddleOCR ส่งผลลัพธ์ที่ไม่มีข้อความ");
     await recordPaddleOcrOutcome(env, row.region, true);
     await audit(env, "paddleocr_done", `${row.job_number}: ${jobId}`, row.region);
-    await completeImageAnalysis(
-      env,
-      row,
-      c.lineToken,
-      imageBytes,
-      text,
-      analyzeOcr(text, true),
-      null,
-      false,
-      PADDLEOCR_PROVIDER,
-      "PaddleOCR"
-    );
+    await continueAfterPaddleOcr(env, row, c.lineToken, imageBytes, text);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     await recordPaddleOcrOutcome(env, row.region, false);
