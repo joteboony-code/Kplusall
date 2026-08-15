@@ -321,6 +321,9 @@ async function audit(env: Pick<Env, "DB">, event: string, detail: string, region
 function queueErrorText(error: unknown) {
   return (error instanceof Error ? error.message : String(error)).slice(0, 500);
 }
+function isQueueQuotaError(error: unknown) {
+  return /daily write operations limit|queues free tier|quota/i.test(queueErrorText(error));
+}
 async function auditQueueDeferral(env: Pick<Env, "DB">, target: string, detail: string, region: Region) {
   try {
     await audit(env, "queue_write_deferred", `${target}: ${detail}`, region);
@@ -333,12 +336,14 @@ async function enqueueOcrJobSafely(
   message: OcrQueueMessage,
   region: Region,
   options?: QueueSendOptions,
+  hooks?: { onQuota?: () => void },
 ) {
   try {
     await env.OCR_JOBS.send(message, options);
     return true;
   } catch (error) {
     const detail = queueErrorText(error);
+    if (isQueueQuotaError(error)) hooks?.onQuota?.();
     console.error(JSON.stringify({ event: "queue_write_deferred", target: "ocr-jobs", region, error: detail, id: message.id }));
     await auditQueueDeferral(env, "ocr-jobs", `${message.id}: ${detail}`, region);
     return false;
@@ -1575,7 +1580,8 @@ async function enqueueOcrSpaceFallback(
   row: Pick<SlipProcessRow, "id" | "region">,
   paddleAttempted: boolean,
   ocrSpaceAttempt = 1,
-  delaySeconds = 0
+  delaySeconds = 0,
+  hooks?: { onQuota?: () => void }
 ) {
   const message = {
     id: row.id,
@@ -1592,6 +1598,7 @@ async function enqueueOcrSpaceFallback(
     return true;
   } catch (error) {
     const detail = queueErrorText(error);
+    if (isQueueQuotaError(error)) hooks?.onQuota?.();
     console.error(JSON.stringify({
       event: "queue_write_deferred",
       target: "ocr-fallback",
@@ -2372,9 +2379,15 @@ async function requeueStuckJobs(env: Env) {
     }>();
   let requeued = 0;
   for (const row of rows.results) {
+    // Claim the row before sending any recovery message.  The previous code
+    // could enqueue the same stale row again every cron tick, especially when
+    // a delayed Paddle poll or fallback message was already in flight.
+    if (!(await claimOcrQueueSlot(env, row.id))) continue;
     let queued: boolean;
+    let quotaBlocked = false;
+    const hooks = { onQuota: () => { quotaBlocked = true; } };
     if (row.status === "queued" && row.ocr_provider?.includes("ocrspace")) {
-      queued = await enqueueOcrSpaceFallback(env, row, row.ocr_provider.includes("paddleocr"));
+      queued = await enqueueOcrSpaceFallback(env, row, row.ocr_provider.includes("paddleocr"), 1, 0, hooks);
     } else {
       if (row.status === "paddle_pending" && row.paddle_job_id) {
         queued = await enqueueOcrJobSafely(env, {
@@ -2384,17 +2397,22 @@ async function requeueStuckJobs(env: Env) {
           paddleJobId: row.paddle_job_id,
           paddlePollCount: row.paddle_poll_count,
           paddleAttempted: true
-        } satisfies OcrQueueMessage, row.region);
+        } satisfies OcrQueueMessage, row.region, undefined, hooks);
       } else {
-        await releaseOcrQueueSlot(env, row.id);
-        queued = await enqueueOcrJobIfNeeded(
+        queued = await enqueueOcrJobSafely(
           env,
           { id: row.id, region: row.region },
           row.region,
+          undefined,
+          hooks,
         );
       }
     }
-    if (!queued) continue;
+    if (!queued) {
+      await releaseOcrQueueSlot(env, row.id);
+      if (quotaBlocked) break;
+      continue;
+    }
     await env.DB.prepare("UPDATE slip_jobs SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('queued','paddle_pending')")
       .bind(row.id).run();
     await audit(env, "image_requeued", row.id, row.region);
