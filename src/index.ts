@@ -676,11 +676,52 @@ function inspectionResultMessage(row: SlipProcessRow, result: "passed" | "failed
   return { type: "text", text: `${jobText}\n${resultText}`, ...quote };
 }
 
+const STOCK_URL = "https://www.aomyim.me/app/eds";
+
+function stockFlexMessage(tid?: string): Record<string, unknown> {
+  const displayTid = /^\d{8}$/.test(tid ?? "") ? tid : "ไม่ระบุ";
+  return {
+    type: "flex",
+    altText: "เปิด Stock เพื่อกรอกข้อมูลงาน",
+    contents: {
+      type: "bubble",
+      size: "micro",
+      body: {
+        type: "box",
+        layout: "vertical",
+        paddingAll: "12px",
+        spacing: "sm",
+        contents: [
+          { type: "text", text: "📦 Stock", weight: "bold", size: "md", color: "#11884A" },
+          { type: "text", text: `Tid: ${displayTid}`, weight: "bold", size: "sm", color: "#333333" },
+          { type: "text", text: "ใส่ข้อมูลอุปกรณ์ ให้ร้านค้า/รับคืน", size: "xs", color: "#777777", wrap: true },
+        ],
+      },
+      footer: {
+        type: "box",
+        layout: "vertical",
+        paddingAll: "10px",
+        paddingTop: "0px",
+        contents: [{
+          type: "button",
+          style: "primary",
+          height: "sm",
+          color: "#08A65C",
+          action: { type: "uri", label: "เปิด Stock", uri: STOCK_URL },
+        }],
+      },
+    },
+  };
+}
+
 export async function replyInspectionResult(token: string, row: SlipProcessRow, result: "passed" | "failed") {
   if (!row.line_reply_token) throw new Error("LINE reply token is unavailable");
+  // Stock Flex is enabled only for the Korat webhook (stored as bangkok).
+  const messages: Record<string, unknown>[] = [inspectionResultMessage(row, result)];
+  if (row.region === "bangkok") messages.push(stockFlexMessage(row.job_number));
   await lineCall(token, "message/reply", {
     replyToken: row.line_reply_token,
-    messages: [inspectionResultMessage(row, result)]
+    messages
   });
 }
 

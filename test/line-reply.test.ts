@@ -77,4 +77,31 @@ describe("LINE inspection delivery", () => {
     expect(payload.messages[0].text).toContain("9.99");
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain("/push");
   });
+
+  it("adds Stock Flex only for Korat", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await replyInspectionResult("channel-token", {
+      id: "slip-korat",
+      region: "bangkok",
+      parent_job_id: "job-korat",
+      line_message_id: "message-korat",
+      line_user_id: "user-korat",
+      r2_key: "bangkok/slip-korat.jpg",
+      status: "passed",
+      job_number: "12345678",
+      line_reply_token: "reply-korat",
+      line_quote_token: null,
+      line_source_type: "user",
+      matched_amount: "1.22",
+      detected_amounts: '["1.22"]',
+      decision_reason: "passed",
+      result_sent_at: null
+    }, "passed");
+
+    const payload = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(payload.messages).toHaveLength(2);
+    expect(payload.messages[1]).toMatchObject({ type: "flex", altText: "เปิด Stock เพื่อกรอกข้อมูลงาน" });
+  });
 });
