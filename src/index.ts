@@ -1,3 +1,5 @@
+import { countSettlementHeadings } from "./settlement";
+
 type Region = "north" | "central" | "isan" | "south" | "bangkok";
 export type Env = {
   DB: D1Database; SLIPS: R2Bucket; LINE_WEBHOOKS: Queue<LineWebhookQueueMessage>;
@@ -9,6 +11,7 @@ type RegionConfigRow = { region: Region; enabled: number; line_channel_secret: A
 type RegionConfig = { region: Region; enabled: boolean; lineSecret: string; lineToken: string; ocrKey: string };
 type OcrResult = "passed" | "failed" | "silent" | "needs_fallback";
 type OcrAnalysis = {
+  settlementCount?: number;
   result: OcrResult;
   foundKplus: boolean;
   foundSettlement: boolean;
@@ -263,19 +266,23 @@ export function extractPaddleOcrText(jsonl: string) {
       continue;
     }
     const result = value?.result ?? value;
+    const layoutText: string[] = [];
+    const ocrText: string[] = [];
     for (const item of result?.layoutParsingResults ?? []) {
       const markdown = item?.markdown?.text;
-      if (typeof markdown === "string" && markdown.trim()) text.push(markdown);
+      if (typeof markdown === "string" && markdown.trim()) layoutText.push(markdown);
     }
     for (const item of result?.ocrResults ?? []) {
       const pruned = item?.prunedResult;
       if (typeof pruned === "string" && pruned.trim()) {
-        text.push(pruned);
+        ocrText.push(pruned);
       } else if (pruned && typeof pruned === "object") {
         const recTexts = pruned.rec_texts ?? pruned.recTexts;
-        if (Array.isArray(recTexts)) text.push(recTexts.map(String).join("\n"));
+        if (Array.isArray(recTexts) && recTexts.length) ocrText.push(recTexts.map(String).join("\n"));
       }
     }
+    // These are alternate representations of the same image, not extra slips.
+    text.push(...(ocrText.some((part) => part.trim()) ? ocrText : layoutText));
   }
   return text.join("\n").trim();
 }
@@ -1084,6 +1091,11 @@ export function analyzeOcr(text: string, requireConfirmedBrand = false): OcrAnal
   const matched = amounts.find((amount) => Math.abs(Math.abs(amount) - 1.22) < 0.005);
   const matchedAmount = matched === undefined ? null : matched.toFixed(2);
   const detectedAmounts = amounts.slice(0, 12).map((amount) => amount.toFixed(2));
+  const settlementCount = countSettlementHeadings(text);
+  if (settlementCount >= 2) {
+    return { result: "silent", settlementCount, foundKplus, foundSettlement, matchedAmount, detectedAmounts,
+      reason: "ข้ามภาพ: พบใบ SETTLEMENT ตั้งแต่ 2 ใบขึ้นไป" };
+  }
   if (!foundKplus || !foundSettlement) {
     const missing = [!foundKplus ? "KPLUS/K+" : "", !foundSettlement ? "SETTLEMENT" : ""].filter(Boolean).join(" และ ");
     return { result: "silent", foundKplus, foundSettlement, matchedAmount, detectedAmounts, reason: `ไม่พบ ${missing} จึงไม่แจ้ง LINE` };
@@ -1106,6 +1118,7 @@ export function analyzeOcr(text: string, requireConfirmedBrand = false): OcrAnal
 export function classify(text: string) { return analyzeOcr(text).result; }
 
 export function shouldUseWorkersAi(analysis: OcrAnalysis, ocrUnavailable = false) {
+  if ((analysis.settlementCount ?? 0) >= 2) return false;
   return ocrUnavailable || (analysis.result !== "passed" &&
     analysis.foundKplus &&
     analysis.foundSettlement);
@@ -1240,7 +1253,7 @@ export function analyzeWorkersAiTranscription(response: unknown): WorkersAiVisio
   const confident = analysis.foundKplus || analysis.foundSettlement || analysis.detectedAmounts.length > 0;
   return {
     ...analysis,
-    result: analysis.result === "silent" ? "needs_fallback" : analysis.result,
+    result: analysis.result === "silent" && (analysis.settlementCount ?? 0) < 2 ? "needs_fallback" : analysis.result,
     confident,
     rawText,
     reason: confident
@@ -1254,6 +1267,9 @@ export function mergeOcrAndWorkersAi(
   ai: WorkersAiVisionAnalysis,
   ocrLabel = "OCR.space"
 ): OcrAnalysis {
+  // Preserve a rejection from either provider; never add their counts.
+  if ((ocr.settlementCount ?? 0) >= 2) return { ...ocr, result: "silent" };
+  if ((ai.settlementCount ?? 0) >= 2) return { ...ai, result: "silent" };
   const aiCanConfirm = ai.confident;
   const foundKplus = ocr.foundKplus || (aiCanConfirm && ai.foundKplus);
   const foundSettlement = ocr.foundSettlement || (aiCanConfirm && ai.foundSettlement);
@@ -1661,7 +1677,7 @@ async function continueAfterPaddleOcr(
   text: string,
 ) {
   const analysis = analyzeOcr(text, true);
-  if (analysis.result === "passed") {
+  if (analysis.result === "passed" || (analysis.settlementCount ?? 0) >= 2) {
     await completeImageAnalysis(
       env,
       row,
