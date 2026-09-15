@@ -7,6 +7,13 @@ const single = "CHANNEL: KPLUS\nSETTLEMENT\nTHB -1.22";
 const multiple = "SETTLEMENT\nHOST: KBANK\nTHB -1.00\n" + single;
 
 describe("multiple settlement image filter", () => {
+  it("28238752: AI repetition must not suppress wrong-amount result", () => {
+    const ocr = analyzeOcr(single.replace("-1.22", "100.00"));
+    const ai = analyzeWorkersAiTranscription("Receipt 1: CHONBURI SETTLEMENT CHANNEL: KPLUS AMOUNT THB 100.00\nReceipt 2: CHONBURI SETTLEMENT");
+    expect(ai.result).toBe("failed");
+    expect(mergeOcrAndWorkersAi(ocr, ai).result).toBe("failed");
+    expect(mergeOcrAndWorkersAi(analyzeOcr(multiple), ai).result).toBe("silent");
+  });
   it("skips two or four headings without forwarding to Workers AI", () => {
     for (const text of [multiple, multiple + "\nSETTLEMENT\nUNIONPAY\nSETTLEMENT\nKBANK FLEET", multiple.replace("-1.22", "-100.00")]) {
       const analysis = analyzeOcr(text, true);
@@ -15,10 +22,10 @@ describe("multiple settlement image filter", () => {
       expect(shouldUseWorkersAi(analysis, true)).toBe(false);
     }
   });
-  it("preserves rejection from either provider", () => {
+  it("ignores repeated AI headings but preserves direct OCR rejection", () => {
     const aiMultiple = analyzeWorkersAiTranscription(multiple);
-    expect(aiMultiple.result).toBe("silent");
-    expect(mergeOcrAndWorkersAi(analyzeOcr(single), aiMultiple).result).toBe("silent");
+    expect(aiMultiple.result).toBe("passed");
+    expect(mergeOcrAndWorkersAi(analyzeOcr(single), aiMultiple).result).toBe("passed");
     expect(mergeOcrAndWorkersAi(analyzeOcr(multiple), analyzeWorkersAiTranscription(single)).result).toBe("silent");
     expect(mergeOcrAndWorkersAi(analyzeOcr(single), analyzeWorkersAiTranscription(single)).result).toBe("passed");
   });

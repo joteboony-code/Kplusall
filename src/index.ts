@@ -1079,7 +1079,7 @@ function isConfirmedKplusReceiptText(normalized: string) {
   );
 }
 
-export function analyzeOcr(text: string, requireConfirmedBrand = false): OcrAnalysis {
+export function analyzeOcr(text: string, requireConfirmedBrand = false, source: "ocr" | "workers-ai" = "ocr"): OcrAnalysis {
   const normalized = normalizeOcrText(text);
   const foundKplus =
     (requireConfirmedBrand
@@ -1091,7 +1091,8 @@ export function analyzeOcr(text: string, requireConfirmedBrand = false): OcrAnal
   const matched = amounts.find((amount) => Math.abs(Math.abs(amount) - 1.22) < 0.005);
   const matchedAmount = matched === undefined ? null : matched.toFixed(2);
   const detectedAmounts = amounts.slice(0, 12).map((amount) => amount.toFixed(2));
-  const settlementCount = countSettlementHeadings(text);
+  // Generated prose can repeat a heading from the same receipt.
+  const settlementCount = source === "ocr" ? countSettlementHeadings(text) : 0;
   if (settlementCount >= 2) {
     return { result: "silent", settlementCount, foundKplus, foundSettlement, matchedAmount, detectedAmounts,
       reason: "ข้ามภาพ: พบใบ SETTLEMENT ตั้งแต่ 2 ใบขึ้นไป" };
@@ -1249,7 +1250,7 @@ export function analyzeWorkersAiTranscription(response: unknown): WorkersAiVisio
       reason: "Workers AI Vision ถอดข้อความที่อ่านได้ไม่สำเร็จ"
     };
   }
-  const analysis = analyzeOcr(rawText);
+  const analysis = analyzeOcr(rawText, false, "workers-ai");
   const confident = analysis.foundKplus || analysis.foundSettlement || analysis.detectedAmounts.length > 0;
   return {
     ...analysis,
@@ -1267,9 +1268,8 @@ export function mergeOcrAndWorkersAi(
   ai: WorkersAiVisionAnalysis,
   ocrLabel = "OCR.space"
 ): OcrAnalysis {
-  // Preserve a rejection from either provider; never add their counts.
+  // Only direct OCR can reject an image based on receipt count.
   if ((ocr.settlementCount ?? 0) >= 2) return { ...ocr, result: "silent" };
-  if ((ai.settlementCount ?? 0) >= 2) return { ...ai, result: "silent" };
   const aiCanConfirm = ai.confident;
   const foundKplus = ocr.foundKplus || (aiCanConfirm && ai.foundKplus);
   const foundSettlement = ocr.foundSettlement || (aiCanConfirm && ai.foundSettlement);
