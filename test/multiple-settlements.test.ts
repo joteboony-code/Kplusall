@@ -7,6 +7,30 @@ const single = "CHANNEL: KPLUS\nSETTLEMENT\nTHB -1.22";
 const multiple = "SETTLEMENT\nHOST: KBANK\nTHB -1.00\n" + single;
 
 describe("multiple settlement image filter", () => {
+
+  // Verbatim excerpt of OCR.space output for image 4/10 in job 62439029.
+  const splitFooter = "AIL: IHB\t-1.22\tSETTLEMENT SUCCESSF\t\r\n'UL\t\r\n";
+  const footerVariants = [
+    splitFooter, "SETTLEMENT SUCCESSF", "SETTLEMENT SUCCESSFU",
+    "SETTLEMENT SUCCESSFUL", "SETTLEMENT SUCCESSFULLY",
+    "SETTLEMENT SUCCESS\nFUL", "settlement\tsuccessf\r\n'ul",
+  ];
+
+  it.each(footerVariants)("62439029: does not count a broken success footer: %s", (footer) => {
+    const text = single + "\n" + footer;
+    expect(countSettlementHeadings(text)).toBe(1);
+    expect(analyzeOcr(text, true).result).toBe("passed");
+  });
+  it("keeps two real headings even with a broken success footer", () => {
+    const text = multiple + "\n" + splitFooter;
+    expect(countSettlementHeadings(text)).toBe(2);
+    expect(analyzeOcr(text, true).result).toBe("silent");
+  });
+  it("does not turn a wrong amount into a pass when ignoring a broken footer", () => {
+    const text = (single + "\n" + splitFooter).replaceAll("-1.22", "-100.00");
+    expect(countSettlementHeadings(text)).toBe(1);
+    expect(analyzeOcr(text, true).result).toBe("failed");
+  });
   it("28238752: AI repetition must not suppress wrong-amount result", () => {
     const ocr = analyzeOcr(single.replace("-1.22", "100.00"));
     const ai = analyzeWorkersAiTranscription("Receipt 1: CHONBURI SETTLEMENT CHANNEL: KPLUS AMOUNT THB 100.00\nReceipt 2: CHONBURI SETTLEMENT");
