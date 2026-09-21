@@ -78,7 +78,10 @@ describe("LINE inspection delivery", () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain("/push");
   });
 
-  it("adds Stock Flex only for Korat", async () => {
+  it.each([
+    { tid: "28607205", result: "passed" as const },
+    { tid: "00112233", result: "failed" as const },
+  ])("adds Stock and Castle buttons for Korat using job TID $tid ($result)", async ({ tid, result }) => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -90,7 +93,7 @@ describe("LINE inspection delivery", () => {
       line_user_id: "user-korat",
       r2_key: "bangkok/slip-korat.jpg",
       status: "passed",
-      job_number: "12345678",
+      job_number: tid,
       line_reply_token: "reply-korat",
       line_quote_token: null,
       line_source_type: "user",
@@ -98,10 +101,18 @@ describe("LINE inspection delivery", () => {
       detected_amounts: '["1.22"]',
       decision_reason: "passed",
       result_sent_at: null
-    }, "passed");
+    }, result);
 
     const payload = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
     expect(payload.messages).toHaveLength(2);
-    expect(payload.messages[1]).toMatchObject({ type: "flex", altText: "เปิด Stock เพื่อกรอกข้อมูลงาน" });
+    expect(payload.messages[1]).toMatchObject({ type: "flex", altText: "เปิด Stock / Castle เพื่อกรอกข้อมูลและปิดงาน" });
+    expect(payload.messages[1].contents.body.contents[1].text).toBe(`Tid: ${tid}`);
+    expect(payload.messages[1].contents.footer.contents).toMatchObject([
+      { action: { type: "uri", label: "เปิด Stock", uri: "https://www.aomyim.me/app/eds" } },
+      { action: { type: "uri", label: "เปิด Castle ปิดงาน", uri: `https://www.castles-th.com/searchtid?job_merc_tid=${tid}` } },
+    ]);
+    expect(payload.messages[1].contents.footer.contents).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.line.me/v2/bot/message/reply");
   });
 });

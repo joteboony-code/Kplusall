@@ -684,29 +684,32 @@ function inspectionResultMessage(row: SlipProcessRow, result: "passed" | "failed
 }
 
 const STOCK_URL = "https://www.aomyim.me/app/eds";
+const CASTLE_TID_URL = "https://www.castles-th.com/searchtid?job_merc_tid=";
 
 function stockFlexMessage(tid?: string): Record<string, unknown> {
-  const displayTid = /^\d{8}$/.test(tid ?? "") ? tid : "ไม่ระบุ";
+  const validTid = /^\d{8}$/.test(tid ?? "");
+  const displayTid = validTid ? tid : "ไม่ระบุ";
   return {
     type: "flex",
-    altText: "เปิด Stock เพื่อกรอกข้อมูลงาน",
+    altText: "เปิด Stock / Castle เพื่อกรอกข้อมูลและปิดงาน",
     contents: {
       type: "bubble",
-      size: "micro",
+      size: "kilo",
       body: {
         type: "box",
         layout: "vertical",
         paddingAll: "12px",
         spacing: "sm",
         contents: [
-          { type: "text", text: "📦 Stock", weight: "bold", size: "md", color: "#11884A" },
+          { type: "text", text: "📦 Stock / Castle", weight: "bold", size: "md", color: "#11884A" },
           { type: "text", text: `Tid: ${displayTid}`, weight: "bold", size: "sm", color: "#333333" },
-          { type: "text", text: "ใส่ข้อมูลอุปกรณ์ ให้ร้านค้า/รับคืน", size: "xs", color: "#777777", wrap: true },
+          { type: "text", text: "กรอกอุปกรณ์ให้ร้านค้า/รับคืน และเปิด Castle เพื่อปิดงาน", size: "xs", color: "#777777", wrap: true },
         ],
       },
       footer: {
         type: "box",
         layout: "vertical",
+        spacing: "sm",
         paddingAll: "10px",
         paddingTop: "0px",
         contents: [{
@@ -715,7 +718,14 @@ function stockFlexMessage(tid?: string): Record<string, unknown> {
           height: "sm",
           color: "#08A65C",
           action: { type: "uri", label: "เปิด Stock", uri: STOCK_URL },
-        }],
+        }, ...(validTid ? [{
+          type: "button",
+          style: "primary",
+          height: "sm",
+          color: "#2463A6",
+          // Use the technician's job reference, never a TID read from the image.
+          action: { type: "uri", label: "เปิด Castle ปิดงาน", uri: CASTLE_TID_URL + encodeURIComponent(tid!) },
+        }] : [])],
       },
     },
   };
